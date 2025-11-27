@@ -60,6 +60,29 @@ def torch_dfs(model: nn.Module, parent_name='root'):
 
 
 @amp.autocast(enabled=False)
+def rope_apply_gaudi(x, grid_sizes, freqs, start=None):
+    n, c = x.size(2), x.size(3) // 2
+    # loop over samples
+    output = []
+    for i, _ in enumerate(x):
+        s = x.size(1)
+        x_real, x_imag = x[i, :s].to(torch.float64).reshape(
+            s, n, -1, 2).unbind(-1)
+        freqs_real, freqs_imag = freqs[i, :s].unbind(-1)
+
+        output_real = x_real * freqs_real - x_imag * freqs_imag
+        output_imag = x_real * freqs_imag + x_imag * freqs_real
+
+        x_i = torch.cat((output_real.unsqueeze(-1), output_imag.unsqueeze(-1)),
+                        dim=-1).flatten(2)
+
+        # apply rotary embedding
+        x_i = torch.cat([x_i, x[i, s:]])
+        # append to collection
+        output.append(x_i)
+    return torch.stack(output).float()
+
+@amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs, start=None):
     n, c = x.size(2), x.size(3) // 2
     # loop over samples
@@ -169,8 +192,8 @@ class WanS2VSelfAttention(WanSelfAttention):
 
         q, k, v = qkv_fn(x)
 
-        q=rope_apply(q.to("cpu"), grid_sizes, freqs).to(x.device)
-        k=rope_apply(k.to("cpu"), grid_sizes, freqs).to(x.device)
+        q=rope_apply_gaudi(q, grid_sizes, freqs)
+        k=rope_apply_gaudi(k, grid_sizes, freqs)
 
         x = attention(
             q=q,
@@ -837,7 +860,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             self.pre_compute_freqs = torch.chunk(
                 self.pre_compute_freqs, get_world_size(), dim=1)
             self.pre_compute_freqs = self.pre_compute_freqs[sp_rank]
-
+        self.pre_compute_freqs = torch.view_as_real(self.pre_compute_freqs).to(self.device)
         # arguments
         kwargs = dict(
             e=e0,
