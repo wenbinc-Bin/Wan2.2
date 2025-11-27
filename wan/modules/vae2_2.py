@@ -7,6 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+try:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+    import habana_frameworks.torch.core as htcore
+    USE_FSDPA = True
+except ModuleNotFoundError:
+    print(f"Cannot find module FusedSDPA")
+
 __all__ = [
     "Wan2_2_VAE",
 ]
@@ -264,11 +271,14 @@ class AttentionBlock(nn.Module):
                                                2).contiguous().chunk(3, dim=-1))
 
         # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        if USE_FSDPA:
+            x = FusedSDPA.apply(q, k, v, None, 0.0, False, None, "fast")
+        else:
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+            )
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output
@@ -575,6 +585,7 @@ class Encoder3d(nn.Module):
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
+        htcore.mark_step()
 
         ## downsamples
         for layer in self.downsamples:
@@ -687,6 +698,7 @@ class Decoder3d(nn.Module):
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
+        htcore.mark_step()
 
         for layer in self.middle:
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
@@ -895,7 +907,7 @@ class Wan2_2_VAE:
         dim_mult=[1, 2, 4, 4],
         temperal_downsample=[False, True, True],
         dtype=torch.float,
-        device="cuda",
+        device="hpu",
     ):
 
         self.dtype = dtype

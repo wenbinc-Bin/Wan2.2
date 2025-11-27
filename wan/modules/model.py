@@ -6,7 +6,8 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from .attention import flash_attention, attention
+import habana_frameworks.torch.core as htcore
 
 __all__ = ['WanModel']
 
@@ -33,6 +34,19 @@ def rope_params(max_seq_len, dim, theta=10000):
                         torch.arange(0, dim, 2).to(torch.float64).div(dim)))
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
+
+
+def rope_params_gaudi(max_seq_len, dim, theta=10000):
+    assert dim % 2 == 0
+    freqs = torch.outer(
+        torch.arange(max_seq_len),
+        1.0 / torch.pow(theta,
+                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
+
+    sin = torch.sin(freqs)
+    cos = torch.cos(freqs)
+
+    return cos, sin
 
 
 @torch.amp.autocast('cuda', enabled=False)
@@ -62,6 +76,44 @@ def rope_apply(x, grid_sizes, freqs):
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection
+        output.append(x_i)
+    return torch.stack(output).float()
+
+
+def rope_apply_gaudi(x, grid_sizes, freqs):
+    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    cos, sin = freqs
+    cos = cos.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    sin = sin.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        x_i = x.to(torch.float64).reshape(s, n, -1, 2)
+        x_real, x_imag = x_i.unbind(-1)  # [B, S, H, D//2]
+        x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+
+        cos_i = torch.cat([
+            cos[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            cos[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            cos[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        sin_i = torch.cat([
+            sin[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            sin[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            sin[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        cos_i = cos_i.to(device=x.device)
+        sin_i = sin_i.to(device=x.device)
+        cos_i = torch.repeat_interleave(cos_i, 2, dim=2).reshape(s, 1, -1, 2)
+        sin_i = torch.repeat_interleave(sin_i, 2, dim=2).reshape(s, 1, -1, 2)
+
+        x_i = (x_i.float() * cos_i + x_rotated.float() * sin_i).flatten(2).to(x.dtype)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+
         output.append(x_i)
     return torch.stack(output).float()
 
@@ -135,19 +187,17 @@ class WanSelfAttention(nn.Module):
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            q = self.norm_q(self.q(x)).reshape(b, s, n, d)
+            k = self.norm_k(self.k(x)).reshape(b, s, n, d)
+            v = self.v(x).reshape(b, s, n, d)
             return q, k, v
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        q = rope_apply_gaudi(q, grid_sizes, freqs).to(q.device)
+        k = rope_apply_gaudi(k, grid_sizes, freqs).to(q.device)
+
+        x = attention(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -167,12 +217,12 @@ class WanCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        q = self.norm_q(self.q(x)).reshape(b, -1, n, d)
+        k = self.norm_k(self.k(context)).reshape(b, -1, n, d)
+        v = self.v(context).reshape(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -235,7 +285,7 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
 
@@ -243,7 +293,7 @@ class WanAttentionBlock(nn.Module):
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function
@@ -251,7 +301,7 @@ class WanAttentionBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.amp.autocast('cuda', dtype=torch.float32):
+            with torch.autocast(device_type="hpu", dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x
 
@@ -283,7 +333,7 @@ class Head(nn.Module):
             e(Tensor): Shape [B, L1, C]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             x = (
                 self.head(
@@ -397,12 +447,18 @@ class WanModel(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+
+        cos = torch.cat([
+            rope_params_gaudi(1024, d - 4 * (d // 6))[0],
+            rope_params_gaudi(1024, 2 * (d // 6))[0],
+            rope_params_gaudi(1024, 2 * (d // 6))[0]
+        ],dim=1).to("hpu")
+        sin = torch.cat([
+            rope_params_gaudi(1024, d - 4 * (d // 6))[1],
+            rope_params_gaudi(1024, 2 * (d // 6))[1],
+            rope_params_gaudi(1024, 2 * (d // 6))[1]
+        ],dim=1).to("hpu")
+        self.freqs = (cos, sin)
 
         # initialize weights
         self.init_weights()
@@ -438,8 +494,6 @@ class WanModel(ModelMixin, ConfigMixin):
             assert y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -459,7 +513,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # time embeddings
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
             e = self.time_embedding(
@@ -488,6 +542,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         for block in self.blocks:
             x = block(x, **kwargs)
+            htcore.mark_step()
 
         # head
         x = self.head(x, e)

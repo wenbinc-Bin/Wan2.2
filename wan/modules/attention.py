@@ -13,6 +13,12 @@ try:
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
+try:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+    USE_FSDPA = True
+except ModuleNotFoundError:
+    print(f"Cannot find module FusedSDPA")
+
 import warnings
 
 __all__ = [
@@ -168,12 +174,15 @@ def attention(
             )
         attn_mask = None
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
+        q = q.transpose(1, 2).to(dtype).contiguous()
+        k = k.transpose(1, 2).to(dtype).contiguous()
+        v = v.transpose(1, 2).to(dtype).contiguous()
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+        if USE_FSDPA:
+            out = FusedSDPA.apply(q, k, v, attn_mask, dropout_p, causal, None, "fast")
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
         out = out.transpose(1, 2).contiguous()
         return out
