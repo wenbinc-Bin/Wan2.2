@@ -12,9 +12,9 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
+import habana_frameworks.torch.core as htcore
 from decord import VideoReader
 from PIL import Image
 from safetensors import safe_open
@@ -85,7 +85,7 @@ class WanS2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device(f"hpu")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -534,7 +534,7 @@ class WanS2V:
         out = []
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.amp.autocast('hpu', dtype=self.param_dtype),
                 torch.no_grad(),
         ):
             for r in range(num_repeat):
@@ -613,7 +613,7 @@ class WanS2V:
                 if offload_model or self.init_on_cpu:
                     self.noise_model.to(self.device)
                     torch.cuda.empty_cache()
-
+                htcore.mark_step()
                 for i, t in enumerate(tqdm(timesteps)):
                     latent_model_input = latents[0:1]
                     timestep = [t]
@@ -640,6 +640,7 @@ class WanS2V:
                         return_dict=False,
                         generator=seed_g)[0]
                     latents[0] = temp_x0.squeeze(0)
+                    htcore.mark_step()
 
                 if offload_model:
                     self.noise_model.cpu()

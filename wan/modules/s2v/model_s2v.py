@@ -27,6 +27,7 @@ from ..model import (
     rope_params,
     sinusoidal_embedding_1d,
 )
+from ..attention import attention
 from .audio_utils import AudioInjector_WAN, CausalAudioEncoder
 from .motioner import FramePackMotioner, MotionerTransformers
 from .s2v_utils import rope_precompute
@@ -168,9 +169,12 @@ class WanS2VSelfAttention(WanSelfAttention):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
+        q=rope_apply(q.to("cpu"), grid_sizes, freqs).to(x.device)
+        k=rope_apply(k.to("cpu"), grid_sizes, freqs).to(x.device)
+
+        x = attention(
+            q=q,
+            k=k,
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
@@ -777,8 +781,8 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             t = torch.cat([t, torch.zeros([1], dtype=t.dtype, device=t.device)])
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+                sinusoidal_embedding_1d(self.freq_dim, t).float()).float()
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim)).float()
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         if self.zero_timestep:
