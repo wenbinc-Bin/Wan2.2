@@ -61,6 +61,61 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
+def rope_apply_gaudi(x, grid_sizes, freqs):
+    """
+    x:          [B, L, N, C].
+    grid_sizes: [B, 3].
+    freqs:      [M, C // 2].
+    """
+    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    cos, sin = freqs
+    cos = cos.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    sin = sin.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        x_i = x.to(torch.float64).reshape(s, n, -1, 2)
+        x_real, x_imag = x_i.unbind(-1)  # [B, S, H, D//2]
+        x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+
+        cos_i = torch.cat([
+            cos[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            cos[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            cos[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        sin_i = torch.cat([
+            sin[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            sin[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            sin[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        cos_i = cos_i.to(device=x.device)
+        sin_i = sin_i.to(device=x.device)
+
+        sp_size = get_world_size()
+        sp_rank = get_rank()
+        cos_i = pad_freqs(cos_i, s * sp_size)
+        sin_i = pad_freqs(sin_i, s * sp_size)
+
+        s_per_rank = s
+        cos_i_rank = cos_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+                                                       s_per_rank), :, :]
+        sin_i_rank = sin_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+                                                       s_per_rank), :, :]
+
+        cos_i_rank = torch.repeat_interleave(cos_i_rank, 2, dim=2).reshape(s, 1, -1, 2)
+        sin_i_rank = torch.repeat_interleave(sin_i_rank, 2, dim=2).reshape(s, 1, -1, 2)
+
+        x_i = (x_i.float() * cos_i_rank + x_rotated.float() * sin_i_rank).flatten(2).to(x.dtype)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        output.append(x_i)
+    return torch.stack(output)
+
+
 def sp_dit_forward(
     self,
     x,
@@ -78,8 +133,6 @@ def sp_dit_forward(
         assert y is not None
     # params
     device = self.patch_embedding.weight.device
-    if self.freqs.device != device:
-        self.freqs = self.freqs.to(device)
 
     if y is not None:
         x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -99,7 +152,7 @@ def sp_dit_forward(
     # time embeddings
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
+    with torch.autocast(device_type="hpu", dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
         e = self.time_embedding(
@@ -159,16 +212,18 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    q = rope_apply(q, grid_sizes, freqs)
-    k = rope_apply(k, grid_sizes, freqs)
+    q = rope_apply_gaudi(q, grid_sizes, freqs)
+    k = rope_apply_gaudi(k, grid_sizes, freqs)
 
-    x = distributed_attention(
-        half(q),
-        half(k),
-        half(v),
-        seq_lens,
-        window_size=self.window_size,
-    )
+    # Gather K/V for sequence parallel
+    k = gather_forward(k, dim=1)
+    v = gather_forward(v, dim=1)
+
+    cp_size = get_world_size()
+    x = self.fav3.forward(half(q), half(k), half(v), cp_size=cp_size)
+
+    if cp_size > 1:
+        torch.hpu.synchronize()
 
     # output
     x = x.flatten(2)
