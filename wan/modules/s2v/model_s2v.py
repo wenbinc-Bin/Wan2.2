@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
+import habana_frameworks.torch.core as htcore
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
@@ -585,15 +586,16 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         return [m.unsqueeze(0) for m in mot
                ], [r.unsqueeze(0) for r in motion_rope_emb]
 
-    def inject_motion(self,
-                      x,
-                      seq_lens,
-                      rope_embs,
-                      mask_input,
-                      motion_latents,
-                      drop_motion_frames=False,
-                      add_last_motion=True):
-        # inject the motion frames token to the hidden states
+    def inject_motion(
+            self,
+            x,
+            seq_lens,
+            rope_embs,
+            mask_input,
+            motion_latents,
+            drop_motion_frames=False,
+            add_last_motion=True):
+                # inject the motion frames token to the hidden states
         if self.enable_motioner:
             mot, mot_remb = self.process_motion_transformer_motioner(
                 motion_latents,
@@ -623,25 +625,28 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
                 ],
                           dim=1) for m, u in zip(mask_input, x)
             ]
-        return x, seq_lens, rope_embs, mask_input
+        return seq_lens, rope_embs, mask_input, mot
 
-    def after_transformer_block(self, block_idx, hidden_states):
+    def after_transformer_block(self,
+                                block_idx,
+                                hidden_states,
+                                original_seq_len,
+                                merged_audio_emb,
+                                audio_emb_global):
         if block_idx in self.audio_injector.injected_block_id.keys():
             audio_attn_id = self.audio_injector.injected_block_id[block_idx]
-            audio_emb = self.merged_audio_emb  # b f n c
+            audio_emb = merged_audio_emb  # b f n c
             num_frames = audio_emb.shape[1]
 
             if self.use_context_parallel:
                 hidden_states = gather_forward(hidden_states, dim=1)
 
-            input_hidden_states = hidden_states[:, :self.
-                                                original_seq_len].clone(
+            input_hidden_states = hidden_states[:, :original_seq_len].clone(
                                                 )  # b (f h w) c
             input_hidden_states = rearrange(
                 input_hidden_states, "b (t n) c -> (b t) n c", t=num_frames)
 
             if self.enbale_adain and self.adain_mode == "attn_norm":
-                audio_emb_global = self.audio_emb_global
                 audio_emb_global = rearrange(audio_emb_global,
                                              "b t n c -> (b t) n c")
                 adain_hidden_states = self.audio_injector.injector_adain_layers[
@@ -664,9 +669,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
                     device=attn_hidden_states.device) * attn_audio_emb.shape[1])
             residual_out = rearrange(
                 residual_out, "(b t) n c -> b (t n) c", t=num_frames)
-            hidden_states[:, :self.
-                          original_seq_len] = hidden_states[:, :self.
-                                                            original_seq_len] + residual_out
+            hidden_states[:, :original_seq_len] = hidden_states[:, :original_seq_len] + residual_out
 
             if self.use_context_parallel:
                 hidden_states = torch.chunk(
@@ -674,10 +677,9 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
 
         return hidden_states
 
-    def forward(
+    def pre_loop(
             self,
             x,
-            t,
             context,
             seq_len,
             ref_latents,
@@ -689,23 +691,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             drop_motion_frames=False,
             *extra_args,
             **extra_kwargs):
-        """
-        x:                  A list of videos each with shape [C, T, H, W].
-        t:                  [B].
-        context:            A list of text embeddings each with shape [L, C].
-        seq_len:            A list of video token lens, no need for this model.
-        ref_latents         A list of reference image for each video with shape [C, 1, H, W].
-        motion_latents      A list of  motion frames for each video with shape [C, T_m, H, W].
-        cond_states         A list of condition frames (i.e. pose) each with shape [C, T, H, W].
-        audio_input         The input audio embedding [B, num_wav2vec_layer, C_a, T_a].
-        motion_frames       The number of motion frames and motion latents frames encoded by vae, i.e. [17, 5]
-        add_last_motion     For the motioner, if add_last_motion > 0, it means that the most recent frame (i.e., the last frame) will be added.
-                            For frame packing, the behavior depends on the value of add_last_motion:
-                            add_last_motion = 0: Only the farthest part of the latent (i.e., clean_latents_4x) is included.
-                            add_last_motion = 1: Both clean_latents_2x and clean_latents_4x are included.
-                            add_last_motion = 2: All motion-related latents are used.
-        drop_motion_frames  Bool, whether drop the motion frames info
-        """
+
         add_last_motion = self.add_last_motion * add_last_motion
         audio_input = torch.cat([
             audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input
@@ -714,13 +700,11 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         audio_emb_res = self.casual_audio_encoder(audio_input)
         if self.enbale_adain:
             audio_emb_global, audio_emb = audio_emb_res
-            self.audio_emb_global = audio_emb_global[:,
+            audio_emb_global = audio_emb_global[:,
                                                      motion_frames[1]:].clone()
         else:
             audio_emb = audio_emb_res
-        self.merged_audio_emb = audio_emb[:, motion_frames[1]:, :]
-
-        device = self.patch_embedding.weight.device
+        merged_audio_emb = audio_emb[:, motion_frames[1]:, :]
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -753,7 +737,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
                          ]
 
         ref = [r.flatten(2).transpose(1, 2) for r in ref]  # r: 1 c f h w
-        self.original_seq_len = seq_lens[0]
+        original_seq_len = seq_lens[0]
 
         seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref],
                                            dtype=torch.long)
@@ -770,32 +754,112 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             for u in x
         ]
         for i in range(len(mask_input)):
-            mask_input[i][:, self.original_seq_len:] = 1
+            mask_input[i][:, original_seq_len:] = 1
 
         # compute the rope embeddings for the input
         x = torch.cat(x)
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
-        self.pre_compute_freqs = rope_precompute(
+        pre_compute_freqs = rope_precompute(
             x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None)
 
         x = [u.unsqueeze(0) for u in x]
-        self.pre_compute_freqs = [
-            u.unsqueeze(0) for u in self.pre_compute_freqs
+        pre_compute_freqs = [
+            u.unsqueeze(0) for u in pre_compute_freqs
         ]
 
-        x, seq_lens, self.pre_compute_freqs, mask_input = self.inject_motion(
+        seq_lens, pre_compute_freqs, mask_input, mot = self.inject_motion(
             x,
             seq_lens,
-            self.pre_compute_freqs,
+            pre_compute_freqs,
             mask_input,
             motion_latents,
             drop_motion_frames=drop_motion_frames,
             add_last_motion=add_last_motion)
 
         x = torch.cat(x, dim=0)
-        self.pre_compute_freqs = torch.cat(self.pre_compute_freqs, dim=0)
+        pre_compute_freqs = torch.cat(pre_compute_freqs, dim=0)
         mask_input = torch.cat(mask_input, dim=0)
+
+        # context
+        context = self.text_embedding(
+            torch.stack([
+                torch.cat(
+                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+                for u in context
+            ]))
+        # grad ckpt args
+        pre_compute_freqs = torch.view_as_real(pre_compute_freqs).to(self.device)
+
+        loop_args = {
+            "context": context,
+            "seq_lens": seq_lens,
+            "ref_latents": ref,
+            "cond_states": cond,
+            "audio_emb_global": audio_emb_global,
+            "merged_audio_emb": merged_audio_emb,
+            "mot": mot,
+            "mask_input": mask_input,
+            "pre_compute_freqs": pre_compute_freqs,
+            "grid_sizes": grid_sizes,
+            "original_grid_sizes": original_grid_sizes,
+            "original_seq_len": original_seq_len,
+        }
+        return loop_args
+
+    def forward(
+            self,
+            x,
+            t,
+            context,
+            seq_lens,
+            ref_latents,
+            cond_states,
+            audio_emb_global = None,
+            merged_audio_emb = None,
+            mot = None,
+            mask_input = None,
+            pre_compute_freqs = None,
+            grid_sizes = None,
+            original_grid_sizes = None,
+            original_seq_len = None,
+            *extra_args,
+            **extra_kwargs):
+        """
+        x:                  A list of videos each with shape [C, T, H, W].
+        t:                  [B].
+        context:            A list of text embeddings each with shape [L, C].
+        seq_len:            A list of video token lens, no need for this model.
+        ref_latents         A list of reference image for each video with shape [C, 1, H, W].
+        motion_latents      A list of  motion frames for each video with shape [C, T_m, H, W].
+        cond_states         A list of condition frames (i.e. pose) each with shape [C, T, H, W].
+        audio_input         The input audio embedding [B, num_wav2vec_layer, C_a, T_a].
+        motion_frames       The number of motion frames and motion latents frames encoded by vae, i.e. [17, 5]
+        add_last_motion     For the motioner, if add_last_motion > 0, it means that the most recent frame (i.e., the last frame) will be added.
+                            For frame packing, the behavior depends on the value of add_last_motion:
+                            add_last_motion = 0: Only the farthest part of the latent (i.e., clean_latents_4x) is included.
+                            add_last_motion = 1: Both clean_latents_2x and clean_latents_4x are included.
+                            add_last_motion = 2: All motion-related latents are used.
+        drop_motion_frames  Bool, whether drop the motion frames info
+        """
+
+        self.audio_emb_global = audio_emb_global
+        self.merged_audio_emb = merged_audio_emb
+        # embeddings
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        # cond states
+        x = [x_ + pose for x_, pose in zip(x, cond_states)]
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+
+        # ref and motion
+        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref_latents)]
+        x = torch.cat(x)
+        x = [u.unsqueeze(0) for u in x]
+
+        if mot and len(mot) > 0:
+            x = [torch.cat([u, m], dim=1) for u, m in zip(x, mot)]
+
+        x = torch.cat(x, dim=0)
 
         x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
 
@@ -818,19 +882,13 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
                 zero_e0.unsqueeze(2).repeat(e0.size(0), 1, 1, 1)
             ],
                            dim=2)
-            e0 = [e0, self.original_seq_len]
+            e0 = [e0, original_seq_len]
         else:
             e0 = e0.unsqueeze(2).repeat(1, 1, 2, 1)
             e0 = [e0, 0]
 
         # context
         context_lens = None
-        context = self.text_embedding(
-            torch.stack([
-                torch.cat(
-                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                for u in context
-            ]))
 
         # grad ckpt args
         def create_custom_forward(module, return_dict=None):
@@ -857,27 +915,29 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             seg_idx = e0[1] - sq_start_size
             e0[1] = seg_idx
 
-            self.pre_compute_freqs = torch.chunk(
-                self.pre_compute_freqs, get_world_size(), dim=1)
-            self.pre_compute_freqs = self.pre_compute_freqs[sp_rank]
-        self.pre_compute_freqs = torch.view_as_real(self.pre_compute_freqs).to(self.device)
+            pre_compute_freqs = torch.chunk(
+                pre_compute_freqs, get_world_size(), dim=1)
+            pre_compute_freqs = pre_compute_freqs[sp_rank]
         # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
+            freqs=pre_compute_freqs,
             context=context,
             context_lens=context_lens)
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x)
+            x = self.after_transformer_block(idx, x, original_seq_len,
+                                merged_audio_emb,
+                                audio_emb_global)
+            htcore.mark_step()
 
         # Context Parallel
         if self.use_context_parallel:
             x = gather_forward(x.contiguous(), dim=1)
         # unpatchify
-        x = x[:, :self.original_seq_len]
+        x = x[:, :original_seq_len]
         # head
         x = self.head(x, e)
         x = self.unpatchify(x, original_grid_sizes)

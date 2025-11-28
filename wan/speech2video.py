@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.utils.internal import is_lazy
 from decord import VideoReader
 from PIL import Image
 from safetensors import safe_open
@@ -597,6 +598,7 @@ class WanS2V:
                     "motion_frames": [self.motion_frames, lat_motion_frames],
                     "drop_motion_frames": drop_first_motion and r == 0,
                 }
+                arg_c = self.noise_model.pre_loop(latents[0:1], **arg_c)
                 if guide_scale > 1:
                     arg_null = {
                         'context': context_null[0:1],
@@ -610,6 +612,7 @@ class WanS2V:
                         ],
                         "drop_motion_frames": drop_first_motion and r == 0,
                     }
+                    arg_null = self.noise_model.pre_loop(latents[0:1], **arg_null)
                 if offload_model or self.init_on_cpu:
                     self.noise_model.to(self.device)
                     torch.cuda.empty_cache()
