@@ -80,7 +80,7 @@ def rope_apply_gaudi(x, grid_sizes, freqs, start=None):
         x_i = torch.cat([x_i, x[i, s:]])
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output)
 
 @amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs, start=None):
