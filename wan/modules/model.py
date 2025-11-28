@@ -6,7 +6,7 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention, attention
+from .attention import flash_attention, attention, FlashAttnV3Gaudi
 import habana_frameworks.torch.core as htcore
 
 __all__ = ['WanModel']
@@ -115,7 +115,7 @@ def rope_apply_gaudi(x, grid_sizes, freqs):
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output)
 
 
 class WanRMSNorm(nn.Module):
@@ -174,6 +174,7 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.fav3 = FlashAttnV3Gaudi()
 
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""
@@ -197,7 +198,7 @@ class WanSelfAttention(nn.Module):
         q = rope_apply_gaudi(q, grid_sizes, freqs).to(q.device)
         k = rope_apply_gaudi(k, grid_sizes, freqs).to(q.device)
 
-        x = attention(q, k, v)
+        x = self.fav3.forward(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -222,7 +223,7 @@ class WanCrossAttention(WanSelfAttention):
         v = self.v(context).reshape(b, -1, n, d)
 
         # compute attention
-        x = attention(q, k, v)
+        x = self.fav3.forward(q, k, v)
 
         # output
         x = x.flatten(2)

@@ -6,6 +6,7 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from ..modules.attention import FlashAttnV3Gaudi
 
 try:
     from habana_frameworks.torch.hpex.kernels import FusedSDPA
@@ -240,6 +241,7 @@ class AttentionBlock(nn.Module):
         self.norm = RMS_norm(dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
+        self.fav3 = FlashAttnV3Gaudi()
 
         # zero out the last layer params
         nn.init.zeros_(self.proj.weight)
@@ -254,10 +256,9 @@ class AttentionBlock(nn.Module):
                                          -1).permute(0, 1, 3,
                                                      2).contiguous().chunk(
                                                          3, dim=-1)
-
         # apply attention
         if USE_FSDPA:
-            x = FusedSDPA.apply(q, k, v, None, 0.0, False, None, "None")
+            x = self.fav3.forward(q, k, v, layout_head_first=True)
         else:
             x = F.scaled_dot_product_attention(
                 q,
