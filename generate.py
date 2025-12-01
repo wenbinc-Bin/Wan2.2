@@ -12,6 +12,8 @@ import random
 
 import torch
 import torch.distributed as dist
+from habana_frameworks import torch as ht
+import habana_frameworks.torch.gpu_migration
 from PIL import Image
 
 import wan
