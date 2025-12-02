@@ -6,6 +6,8 @@ from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
 
+from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
+
 
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape
@@ -137,6 +139,8 @@ def sp_dit_forward(
     if y is not None:
         x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
+    freqs = self.rope(x[0])
+
     # embeddings
     x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
     grid_sizes = torch.stack(
@@ -174,12 +178,16 @@ def sp_dit_forward(
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
+    cos = torch.chunk(freqs[0], get_world_size(), dim=1)[get_rank()]
+    sin = torch.chunk(freqs[1], get_world_size(), dim=1)[get_rank()]
+    freqs = (cos, sin)
+
     # arguments
     kwargs = dict(
         e=e0,
         seq_lens=seq_lens,
         grid_sizes=grid_sizes,
-        freqs=self.freqs,
+        freqs=freqs,
         context=context,
         context_lens=context_lens)
 
@@ -212,8 +220,9 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    q = rope_apply_gaudi(q, grid_sizes, freqs)
-    k = rope_apply_gaudi(k, grid_sizes, freqs)
+
+    q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+    k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
 
     # Gather K/V for sequence parallel
     k = gather_forward(k, dim=1)
