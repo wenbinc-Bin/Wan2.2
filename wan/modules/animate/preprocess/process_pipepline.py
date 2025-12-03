@@ -31,7 +31,7 @@ class ProcessPipeline():
 
         model_cfg = "sam2_hiera_l.yaml"
         if sam_checkpoint_path is not None:
-            self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path)
+            self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path, device="hpu")
         if flux_kontext_path is not None:
             self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
 

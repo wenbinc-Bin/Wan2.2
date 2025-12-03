@@ -13,6 +13,8 @@ try:
 except ImportError:
     flash_attn_func = None
 
+from ..attention import attention as attention_gaudi
+
 MEMORY_LAYOUT = {
     "flash": (
         lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
@@ -70,12 +72,12 @@ def attention(
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal)
 
     elif mode == "flash":
-        x = flash_attn_func(
+        x = attention_gaudi(
             q,
             k,
             v,
         )
-        x = x.view(batch_size, max_seqlen_q, x.shape[-2], x.shape[-1])  # reshape x to [b, s, a, d]
+        x = x.reshape(batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]) # reshape x to [b, s, a, d]
     elif mode == "vanilla":
         scale_factor = 1 / math.sqrt(q.size(-1))
 

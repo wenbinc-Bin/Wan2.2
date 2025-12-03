@@ -318,7 +318,7 @@ def generate(args):
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
+    device = "hpu" #local_rank
     _init_logging(rank)
 
     if args.offload_model is None:
@@ -564,7 +564,7 @@ def generate(args):
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
 
-    torch.cuda.synchronize()
+    #torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

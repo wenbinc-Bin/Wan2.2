@@ -350,6 +350,7 @@ class Encoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## middle
         for layer in self.middle:
@@ -357,6 +358,7 @@ class Encoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## head
         for layer in self.head:
@@ -375,6 +377,7 @@ class Encoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+            htcore.mark_step()
         return x
 
 

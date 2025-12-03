@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
-from ..attention import flash_attention
+from ..attention import attention
 from ..tokenizers import HuggingfaceTokenizer
 from .xlm_roberta import XLMRoberta
 
@@ -82,7 +82,7 @@ class SelfAttention(nn.Module):
 
         # compute attention
         p = self.attn_dropout if self.training else 0.0
-        x = flash_attention(q, k, v, dropout_p=p, causal=self.causal, version=2)
+        x = attention(q, k, v, dropout_p=p, causal=self.causal)
         x = x.reshape(b, s, c)
 
         # output
@@ -173,7 +173,7 @@ class AttentionPool(nn.Module):
 
         # layers
         gain = 1.0 / math.sqrt(dim)
-        self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim))
+        self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim)).to(torch.bfloat16)
         self.to_q = nn.Linear(dim, dim)
         self.to_kv = nn.Linear(dim, dim * 2)
         self.proj = nn.Linear(dim, dim)
@@ -194,7 +194,7 @@ class AttentionPool(nn.Module):
         k, v = self.to_kv(x).view(b, s, 2, n, d).unbind(2)
 
         # compute attention
-        x = flash_attention(q, k, v, version=2)
+        x = attention(q, k, v)
         x = x.reshape(b, 1, c)
 
         # output
@@ -252,7 +252,7 @@ class VisionTransformer(nn.Module):
             stride=patch_size,
             bias=not pre_norm)
         if pool_type in ('token', 'token_fc'):
-            self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim))
+            self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim)).to(torch.bfloat16)
         self.pos_embedding = nn.Parameter(gain * torch.randn(
             1, self.num_patches +
             (1 if pool_type in ('token', 'token_fc') else 0), dim))
@@ -516,7 +516,7 @@ class CLIPModel:
         self.model = self.model.eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
         self.model.load_state_dict(
-            torch.load(checkpoint_path, map_location='cpu'))
+            torch.load(checkpoint_path, map_location='cpu'), strict=False)
 
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(

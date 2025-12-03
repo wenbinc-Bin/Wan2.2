@@ -30,6 +30,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+import habana_frameworks.torch.core as htcore
 
 
 
@@ -77,7 +78,7 @@ class WanAnimate:
             use_relighting_lora (`bool`, *optional*, defaults to False):
                Whether to use relighting lora for character replacement. 
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = "hpu"#torch.device(f"cuda:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -100,7 +101,7 @@ class WanAnimate:
         )
 
         self.clip = CLIPModel(
-            dtype=torch.float16,
+            dtype=torch.bfloat16,
             device=self.device,
             checkpoint_path=os.path.join(checkpoint_dir,
                                          config.clip_checkpoint),
@@ -600,6 +601,8 @@ class WanAnimate:
                         "face_pixel_values": face_pixel_values_uncond,
                     }
 
+                htcore.mark_step()
+
                 for i, t in enumerate(tqdm(timesteps)):
                     latent_model_input = latents
                     timestep = [t]
@@ -621,6 +624,7 @@ class WanAnimate:
                         )
                     else:
                         noise_pred = noise_pred_cond
+                    htcore.mark_step()
 
                     temp_x0 = sample_scheduler.step(
                         noise_pred[0].unsqueeze(0),
@@ -630,8 +634,10 @@ class WanAnimate:
                         generator=seed_g,
                     )[0]
                     latents[0] = temp_x0.squeeze(0)
+                    htcore.mark_step()
 
                     x0 = latents
+                    htcore.mark_step()
 
                 x0 = [x.to(dtype=torch.float32) for x in x0]
                 out_frames = torch.stack(self.vae.decode([x0[0][:, 1:]]))
