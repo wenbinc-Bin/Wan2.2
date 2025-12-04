@@ -3,6 +3,6 @@ peft
 onnxruntime
 pandas
 matplotlib
-#-e  git+https://github.com/facebookresearch/sam2.git@0e78a118995e66bb27d78518c4bd9a3e95b4e266#egg=SAM-2 
+-e  git+https://github.com/miaojinc/sam2-hpu-fork.git@6bb2419e9de4c892b6b93211a287d8ee83b06747#egg=SAM-2 
 loguru
 sentencepiece
