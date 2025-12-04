@@ -30,12 +30,15 @@ from ..model import (
     attention,
     rope_params_gaudi,
     sinusoidal_embedding_1d,
+    WanRotaryPosEmbed,
     rope_apply_gaudi
 )
 
 from .face_blocks import FaceEncoder, FaceAdapter
 from .motion_encoder import Generator
 import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
+
 
 class HeadAnimate(Head):
 
@@ -73,9 +76,12 @@ class WanAnimateSelfAttention(WanSelfAttention):
 
         q, k, v = qkv_fn(x)
 
+        q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+        k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+
         x = attention(
-            q=rope_apply_gaudi(q, grid_sizes, freqs),
-            k=rope_apply_gaudi(k, grid_sizes, freqs),
+            q=q, #rope_apply_gaudi(q, grid_sizes, freqs),
+            k=k, #rope_apply_gaudi(k, grid_sizes, freqs),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
@@ -314,17 +320,8 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        cos = torch.cat([
-            rope_params_gaudi(1024, d - 4 * (d // 6))[0],
-            rope_params_gaudi(1024, 2 * (d // 6))[0],
-            rope_params_gaudi(1024, 2 * (d // 6))[0]
-        ], dim=1).to("hpu")
-        sin = torch.cat([
-            rope_params_gaudi(1024, d - 4 * (d // 6))[1],
-            rope_params_gaudi(1024, 2 * (d // 6))[1],
-            rope_params_gaudi(1024, 2 * (d // 6))[1]
-        ], dim=1).to("hpu")
-        self.freqs = (cos, sin)
+
+        self.rope = WanRotaryPosEmbed(d, patch_size)
 
         self.img_emb = MLPProj(1280, dim)
         
@@ -395,6 +392,8 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
+        freqs = self.rope(x[0])
+
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         x, motion_vec = self.after_patch_embedding(x, pose_latents, face_pixel_values)
@@ -435,7 +434,7 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.freqs,
+            freqs=freqs,
             context=context,
             context_lens=context_lens)
 
