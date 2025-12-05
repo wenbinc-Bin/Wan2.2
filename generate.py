@@ -318,7 +318,7 @@ def generate(args):
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = "hpu" #local_rank
+    device = local_rank
     _init_logging(rank)
 
     if args.offload_model is None:

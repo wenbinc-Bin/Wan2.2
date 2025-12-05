@@ -78,7 +78,7 @@ class WanAnimate:
             use_relighting_lora (`bool`, *optional*, defaults to False):
                Whether to use relighting lora for character replacement. 
         """
-        self.device = "hpu"#torch.device(f"cuda:{device_id}")
+        self.device = torch.device("hpu")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
