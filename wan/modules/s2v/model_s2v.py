@@ -8,6 +8,7 @@ import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
 import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
@@ -193,8 +194,8 @@ class WanS2VSelfAttention(WanSelfAttention):
 
         q, k, v = qkv_fn(x)
 
-        q=rope_apply_gaudi(q, grid_sizes, freqs)
-        k=rope_apply_gaudi(k, grid_sizes, freqs)
+        q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+        k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
 
         x = attention(
             q=q,
@@ -790,6 +791,9 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             ]))
         # grad ckpt args
         pre_compute_freqs = torch.view_as_real(pre_compute_freqs).to(self.device)
+        cos, sin = pre_compute_freqs.unbind(-1)
+        sin = torch.repeat_interleave(sin, 2, dim=-1)
+        cos = torch.repeat_interleave(cos, 2, dim=-1)
 
         loop_args = {
             "context": context,
@@ -800,7 +804,7 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             "merged_audio_emb": merged_audio_emb,
             "mot": mot,
             "mask_input": mask_input,
-            "pre_compute_freqs": pre_compute_freqs,
+            "pre_compute_freqs": (cos, sin),
             "grid_sizes": grid_sizes,
             "original_grid_sizes": original_grid_sizes,
             "original_seq_len": original_seq_len,
