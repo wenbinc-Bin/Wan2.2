@@ -197,12 +197,7 @@ class WanS2VSelfAttention(WanSelfAttention):
         q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
         k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
 
-        x = attention(
-            q=q,
-            k=k,
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        x = self.fav3.forward(q,k,v)
 
         # output
         x = x.flatten(2)
