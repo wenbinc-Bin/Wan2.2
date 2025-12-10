@@ -141,16 +141,18 @@ def sp_attn_forward_s2v(self,
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    q = rope_apply_usp(q, grid_sizes, freqs)
-    k = rope_apply_usp(k, grid_sizes, freqs)
+    q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+    k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
 
-    x = distributed_attention(
-        half(q),
-        half(k),
-        half(v),
-        seq_lens,
-        window_size=self.window_size,
-    )
+    # Gather K/V for sequence parallel
+    k = gather_forward(k, dim=1)
+    v = gather_forward(v, dim=1)
+
+    cp_size = get_world_size()
+    x = self.fav3.forward(half(q), half(k), half(v), cp_size=cp_size)
+
+    if cp_size > 1:
+        torch.hpu.synchronize()
 
     # output
     x = x.flatten(2)
@@ -914,9 +916,10 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
             seg_idx = e0[1] - sq_start_size
             e0[1] = seg_idx
 
-            pre_compute_freqs = torch.chunk(
-                pre_compute_freqs, get_world_size(), dim=1)
-            pre_compute_freqs = pre_compute_freqs[sp_rank]
+            cos, sin = pre_compute_freqs
+            cos = torch.chunk(cos, get_world_size(), dim=1)[sp_rank]
+            sin = torch.chunk(sin, get_world_size(), dim=1)[sp_rank]
+            pre_compute_freqs = (cos, sin)
         # arguments
         kwargs = dict(
             e=e0,
