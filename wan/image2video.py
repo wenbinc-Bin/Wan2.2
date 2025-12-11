@@ -71,7 +71,7 @@ class WanI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device("hpu")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -275,7 +275,7 @@ class WanI2V:
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
+        seed_g = torch.Generator("cpu")
         seed_g.manual_seed(seed)
         noise = torch.randn(
             16,
