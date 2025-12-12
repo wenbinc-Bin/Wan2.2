@@ -617,7 +617,9 @@ class WanS2V:
                     self.noise_model.to(self.device)
                     torch.cuda.empty_cache()
                 htcore.mark_step()
-                for i, t in enumerate(tqdm(timesteps)):
+                for _ in tqdm(range(len(timesteps))):
+                    t = timesteps[0]
+                    timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                     latent_model_input = latents[0:1]
                     timestep = [t]
 
