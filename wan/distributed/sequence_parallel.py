@@ -1,6 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 import torch.cuda.amp as amp
+import torch.nn.functional as F
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
@@ -148,6 +149,7 @@ def sp_dit_forward(
     x = [u.flatten(2).transpose(1, 2) for u in x]
     seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
     assert seq_lens.max() <= seq_len
+    pad_len = seq_len - seq_lens.max()
     x = torch.cat([
         torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
         for u in x
@@ -178,8 +180,12 @@ def sp_dit_forward(
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
-    cos = torch.chunk(freqs[0], get_world_size(), dim=1)[get_rank()]
-    sin = torch.chunk(freqs[1], get_world_size(), dim=1)[get_rank()]
+    cos, sin = freqs
+    if pad_len > 0:
+        cos = F.pad(cos, (0, 0, 0, 0, 0, pad_len))
+        sin = F.pad(sin, (0, 0, 0, 0, 0, pad_len))
+    cos = torch.chunk(cos, get_world_size(), dim=1)[get_rank()]
+    sin = torch.chunk(sin, get_world_size(), dim=1)[get_rank()]
     freqs = (cos, sin)
 
     # arguments
