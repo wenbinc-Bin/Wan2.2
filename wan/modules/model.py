@@ -347,19 +347,16 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
-        with torch.autocast(device_type="hpu", dtype=torch.float32):
-            x = x + y * e[2].squeeze(2)
+        norm_x = (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).type_as(x)
+        y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
+        x = (x.float() + y * e[2].squeeze(2)).type_as(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(
-                self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.autocast(device_type="hpu", dtype=torch.float32):
-                x = x + y * e[5].squeeze(2)
+            norm_x = (self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).type_as(x)
+            y = self.ffn(norm_x)
+            x = (x.float() + y * e[5].squeeze(2)).type_as(x)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
