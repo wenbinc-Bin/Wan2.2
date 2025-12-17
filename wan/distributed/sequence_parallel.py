@@ -7,6 +7,7 @@ from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
 
+import habana_frameworks.torch.core as htcore
 from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
 
 
@@ -199,6 +200,7 @@ def sp_dit_forward(
 
     for block in self.blocks:
         x = block(x, **kwargs)
+        htcore.mark_step()
 
     # head
     x = self.head(x, e)

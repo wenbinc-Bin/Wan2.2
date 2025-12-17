@@ -139,7 +139,8 @@ class WanRMSNorm(nn.Module):
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
+            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
 
 class WanLayerNorm(nn.LayerNorm):
@@ -254,6 +255,7 @@ class WanSelfAttention(nn.Module):
         q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
         k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
 
+        htcore.mark_step()
         x = self.fav3.forward(q, k, v)
 
         # output
@@ -350,6 +352,7 @@ class WanAttentionBlock(nn.Module):
         norm_x = (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).type_as(x)
         y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
         x = (x.float() + y * e[2].squeeze(2)).type_as(x)
+        htcore.mark_step()
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
