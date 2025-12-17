@@ -226,7 +226,7 @@ class FlashAttnV3Gaudi:
                 fsdpa_mode,
                 None
             )
-            return output.permute(0, 2, 1, 3).contiguous()
+            return output.permute(0, 2, 1, 3).contiguous() if not layout_head_first else output
 
         #Flash Attention V3 for Full Attention
         linv_factor = 128.0 if fsdpa_mode == "fast" else 1.0
