@@ -483,7 +483,7 @@ class WanTI2V:
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
+        seed_g = torch.Generator("cpu")
         seed_g.manual_seed(seed)
         noise = torch.randn(
             self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
