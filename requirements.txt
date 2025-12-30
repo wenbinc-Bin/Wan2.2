@@ -12,5 +12,5 @@ easydict
 ftfy
 dashscope
 imageio-ffmpeg
-#flash_attn
+librosa
 numpy>=1.23.5,<2
