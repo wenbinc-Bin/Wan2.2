@@ -9,6 +9,11 @@ import torch.nn.functional as F
 
 from .tokenizers import HuggingfaceTokenizer
 
+try:
+    import habana_frameworks.torch.core as htcore
+except ModuleNotFoundError:
+    print("Synapse PyTorch is not available")
+
 __all__ = [
     'T5Model',
     'T5Encoder',
@@ -307,6 +312,7 @@ class T5Encoder(nn.Module):
                                x.size(1)) if self.shared_pos else None
         for block in self.blocks:
             x = block(x, mask, pos_bias=e)
+            htcore.mark_step()
         x = self.norm(x)
         x = self.dropout(x)
         return x
@@ -364,6 +370,7 @@ class T5Decoder(nn.Module):
                                x.size(1)) if self.shared_pos else None
         for block in self.blocks:
             x = block(x, mask, encoder_states, encoder_mask, pos_bias=e)
+            htcore.mark_step()
         x = self.norm(x)
         x = self.dropout(x)
         return x

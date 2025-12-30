@@ -595,6 +595,7 @@ class Encoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## middle
         for layer in self.middle:
@@ -602,6 +603,7 @@ class Encoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## head
         for layer in self.head:
@@ -622,6 +624,7 @@ class Encoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         return x
 
@@ -707,6 +710,7 @@ class Decoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## upsamples
         for layer in self.upsamples:
@@ -714,6 +718,7 @@ class Decoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx, first_chunk)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## head
         for layer in self.head:
@@ -734,6 +739,8 @@ class Decoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+            htcore.mark_step()
+
         return x
 
 
@@ -814,6 +821,7 @@ class WanVAE_(nn.Module):
                     feat_idx=self._enc_conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
+            htcore.mark_step()
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         if isinstance(scale[0], torch.Tensor):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
@@ -848,6 +856,7 @@ class WanVAE_(nn.Module):
                     feat_idx=self._conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
+            htcore.mark_step()
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
         return out
