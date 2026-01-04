@@ -425,6 +425,15 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             context_clip = self.img_emb(clip_fea) # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
+
+        if self.use_context_parallel:
+            x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
+
+            cos, sin = freqs
+            cos = torch.chunk(cos, get_world_size(), dim=1)[get_rank()]
+            sin = torch.chunk(sin, get_world_size(), dim=1)[get_rank()]
+            freqs = (cos, sin)
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -433,9 +442,6 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             freqs=freqs,
             context=context,
             context_lens=context_lens)
-
-        if self.use_context_parallel:
-            x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
 
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
