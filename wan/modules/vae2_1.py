@@ -225,6 +225,7 @@ class ResidualBlock(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+            htcore.mark_step()
         return x + h
 
 
@@ -460,6 +461,7 @@ class Decoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## upsamples
         for layer in self.upsamples:
@@ -467,6 +469,7 @@ class Decoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## head
         for layer in self.head:
@@ -485,6 +488,7 @@ class Decoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+            htcore.mark_step()
         return x
 
 
