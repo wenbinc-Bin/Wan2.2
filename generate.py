@@ -3,6 +3,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 
@@ -296,6 +297,12 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+    parser.add_argument(
+        "--loop",
+        type=int,
+        default=1,
+        help="Number of benchmark loops for generation.",
+    )
     args = parser.parse_args()
     _validate_args(args)
 
@@ -415,18 +422,6 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-
-        logging.info(f"Generating video ...")
-        video = wan_t2v.generate(
-            args.prompt,
-            size=SIZE_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
         wan_ti2v = wan.WanTI2V(
@@ -440,20 +435,6 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-
-        logging.info(f"Generating video ...")
-        video = wan_ti2v.generate(
-            args.prompt,
-            img=img,
-            size=SIZE_CONFIGS[args.size],
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
     elif "animate" in args.task:
         logging.info("Creating Wan-Animate pipeline.")
         wan_animate = wan.WanAnimate(
@@ -468,19 +449,6 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
             use_relighting_lora=args.use_relighting_lora
         )
-
-        logging.info(f"Generating video ...")
-        video = wan_animate.generate(
-            src_root_path=args.src_root_path,
-            replace_flag=args.replace_flag,
-            refert_num = args.refert_num,
-            clip_len=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
     elif "s2v" in args.task:
         logging.info("Creating WanS2V pipeline.")
         wan_s2v = wan.WanS2V(
@@ -493,27 +461,6 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
-        )
-        logging.info(f"Generating video ...")
-        video = wan_s2v.generate(
-            input_prompt=args.prompt,
-            ref_image_path=args.image,
-            audio_path=args.audio,
-            enable_tts=args.enable_tts,
-            tts_prompt_audio=args.tts_prompt_audio,
-            tts_prompt_text=args.tts_prompt_text,
-            tts_text=args.tts_text,
-            num_repeat=args.num_clip,
-            pose_video=args.pose_video,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            infer_frames=args.infer_frames,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model,
-            init_first_frame=args.start_from_ref,
         )
     else:
         logging.info("Creating WanI2V pipeline.")
@@ -528,18 +475,85 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        logging.info("Generating video ...")
-        video = wan_i2v.generate(
-            args.prompt,
-            img,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+    
+    logging.info(f"Generating video ...")
+    for i in range(args.loop):
+        t0 = time.time()
+        if "t2v" in args.task:
+            video = wan_t2v.generate(
+                args.prompt,
+                size=SIZE_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        elif "ti2v" in args.task:
+            video = wan_ti2v.generate(
+                args.prompt,
+                img=img,
+                size=SIZE_CONFIGS[args.size],
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        elif "animate" in args.task:
+            video = wan_animate.generate(
+                src_root_path=args.src_root_path,
+                replace_flag=args.replace_flag,
+                refert_num = args.refert_num,
+                clip_len=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        elif "s2v" in args.task:
+            video = wan_s2v.generate(
+                input_prompt=args.prompt,
+                ref_image_path=args.image,
+                audio_path=args.audio,
+                enable_tts=args.enable_tts,
+                tts_prompt_audio=args.tts_prompt_audio,
+                tts_prompt_text=args.tts_prompt_text,
+                tts_text=args.tts_text,
+                num_repeat=args.num_clip,
+                pose_video=args.pose_video,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                infer_frames=args.infer_frames,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model,
+                init_first_frame=args.start_from_ref,
+            )
+        else:
+            video = wan_i2v.generate(
+                args.prompt,
+                img,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+        torch.hpu.synchronize()
+        torch.distributed.barrier()
+        t1 = time.time()
+        duration = t1 - t0
+        if rank == 0:
+            print("Wan Generation Latency in Loop #{:d}: {:.1f} sec".format(i, duration))
 
     if rank == 0:
         if args.save_file is None:
@@ -564,7 +578,6 @@ def generate(args):
                 merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
 
-    #torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

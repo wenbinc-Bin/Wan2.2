@@ -332,11 +332,13 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for _ in tqdm(range(len(timesteps))):
+                t = timesteps[0]
+                timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                 latent_model_input = latents
                 timestep = [t]
 
-                timestep = torch.stack(timestep)
+                timestep = torch.stack(timestep).to(self.device)
 
                 model = self._prepare_model_for_timestep(
                     t, boundary, offload_model)

@@ -603,11 +603,13 @@ class WanAnimate:
 
                 htcore.mark_step()
 
-                for i, t in enumerate(tqdm(timesteps)):
+                for _ in tqdm(range(len(timesteps))):
+                    t = timesteps[0]
+                    timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                     latent_model_input = latents
                     timestep = [t]
 
-                    timestep = torch.stack(timestep)
+                    timestep = torch.stack(timestep).to(self.device)
 
                     noise_pred_cond = TensorList(
                          self.noise_model(TensorList(latent_model_input), t=timestep, **arg_c)

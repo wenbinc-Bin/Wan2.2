@@ -379,7 +379,9 @@ class WanI2V:
             if offload_model:
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for _ in tqdm(range(len(timesteps))):
+                t = timesteps[0]
+                timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
