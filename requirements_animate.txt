@@ -1,5 +1,5 @@
 decord
-peft
+peft==0.17.0
 onnxruntime
 pandas
 matplotlib
