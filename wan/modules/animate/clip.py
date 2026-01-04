@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
-from ..attention import attention
+from ..attention import FlashAttnV3Gaudi
 from ..tokenizers import HuggingfaceTokenizer
 from .xlm_roberta import XLMRoberta
 
@@ -66,6 +66,7 @@ class SelfAttention(nn.Module):
         self.causal = causal
         self.attn_dropout = attn_dropout
         self.proj_dropout = proj_dropout
+        self.fav3 = FlashAttnV3Gaudi()
 
         # layers
         self.to_qkv = nn.Linear(dim, dim * 3)
@@ -82,7 +83,7 @@ class SelfAttention(nn.Module):
 
         # compute attention
         p = self.attn_dropout if self.training else 0.0
-        x = attention(q, k, v, dropout_p=p, causal=self.causal)
+        x = self.fav3.forward(q, k, v)
         x = x.reshape(b, s, c)
 
         # output
@@ -176,6 +177,7 @@ class AttentionPool(nn.Module):
         self.cls_embedding = nn.Parameter(gain * torch.randn(1, 1, dim)).to(torch.bfloat16)
         self.to_q = nn.Linear(dim, dim)
         self.to_kv = nn.Linear(dim, dim * 2)
+        self.fav3 = FlashAttnV3Gaudi()
         self.proj = nn.Linear(dim, dim)
         self.norm = LayerNorm(dim, eps=norm_eps)
         self.mlp = nn.Sequential(
@@ -194,7 +196,7 @@ class AttentionPool(nn.Module):
         k, v = self.to_kv(x).view(b, s, 2, n, d).unbind(2)
 
         # compute attention
-        x = attention(q, k, v)
+        x = self.fav3(q, k, v)
         x = x.reshape(b, 1, c)
 
         # output
