@@ -549,7 +549,8 @@ def generate(args):
                 seed=args.base_seed,
                 offload_model=args.offload_model)
         torch.hpu.synchronize()
-        torch.distributed.barrier()
+        if dist.is_initialized():
+            dist.barrier()
         t1 = time.time()
         duration = t1 - t0
         if rank == 0:
