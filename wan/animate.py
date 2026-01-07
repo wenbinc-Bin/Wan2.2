@@ -351,7 +351,7 @@ class WanAnimate:
         """
         assert refert_num == 1 or refert_num == 5, "refert_num should be 1 or 5."
 
-        seed_g = torch.Generator(device=self.device)
+        seed_g = torch.Generator("cpu")
         seed_g.manual_seed(seed)
 
         if n_prompt == "":
@@ -470,9 +470,9 @@ class WanAnimate:
                     target_shape[1],
                     target_shape[2],
                     dtype=torch.float32,
-                    device=self.device,
+                    device="cpu",
                     generator=seed_g,
-                )
+                ).to(self.device)
             ]
         
             max_seq_len = int(math.ceil(np.prod(target_shape) // 4 / self.sp_size)) * self.sp_size
