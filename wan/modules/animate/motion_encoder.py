@@ -4,12 +4,14 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import habana_frameworks.torch.core as htcore
 
 def custom_qr(input_tensor):
     original_dtype = input_tensor.dtype
     if original_dtype == torch.bfloat16:
-        q, r = torch.linalg.qr(input_tensor.to(torch.float32))
-        return q.to(original_dtype), r.to(original_dtype)
+        q, r = torch.linalg.qr(input_tensor.to("cpu").to(torch.float32))
+        return q.to("hpu").to(original_dtype), r.to("hpu").to(original_dtype)
+
     return torch.linalg.qr(input_tensor)
 
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
@@ -281,7 +283,8 @@ class Direction(nn.Module):
             return Q
         else:
             input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
-            out = torch.matmul(input_diag, Q.T)
+            htcore.mark_step()
+            out = torch.matmul(input_diag.float(), Q.T.float())
             out = torch.sum(out, dim=1)
             return out
 
@@ -302,6 +305,8 @@ class Generator(nn.Module):
     def get_motion(self, img):
         #motion_feat = self.enc.enc_motion(img)
         motion_feat = torch.utils.checkpoint.checkpoint((self.enc.enc_motion), img, use_reentrant=True)
-        with torch.cuda.amp.autocast(dtype=torch.float32):
+
+        with torch.autocast(device_type="hpu", dtype=torch.float32, enabled=True):
             motion = self.dec.direction(motion_feat)
+
         return motion
