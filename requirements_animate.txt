@@ -3,6 +3,6 @@ peft==0.17.0
 onnxruntime
 pandas
 matplotlib
--e  git+https://github.com/miaojinc/sam2-hpu-fork.git@6bb2419e9de4c892b6b93211a287d8ee83b06747#egg=SAM-2 
+-e  git+https://github.com/HabanaAI/optimum-habana-fork/tree/aice/v1.22.0/sam2#egg=SAM-2
 loguru
 sentencepiece
