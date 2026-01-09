@@ -19,6 +19,8 @@ from omegaconf import OmegaConf
 from sam2.utils.misc import AsyncVideoFrameLoader, _load_img_as_tensor
 from sam2.build_sam import _load_checkpoint
 
+import habana_frameworks.torch.core as htcore
+
 
 def _load_img_v2_as_tensor(img, image_size):
     img_pil = Image.fromarray(img.astype(np.uint8))
