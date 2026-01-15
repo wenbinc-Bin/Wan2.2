@@ -6,3 +6,6 @@ matplotlib
 -e  git+https://github.com/HabanaAI/optimum-habana-fork/tree/aice/v1.22.0/sam2#egg=SAM-2
 loguru
 sentencepiece
+moviepy
+hydra-core
+pytest
