@@ -474,8 +474,11 @@ class WanAnimate:
                     generator=seed_g,
                 ).to(self.device)
             ]
-        
+
             max_seq_len = int(math.ceil(np.prod(target_shape) // 4 / self.sp_size)) * self.sp_size
+            # Paddin to be divisible by t dim
+            if max_seq_len % (lat_t + 1) != 0:
+                max_seq_len = int(max_seq_len // (lat_t + 1) + 1) * (lat_t + 1)
             if max_seq_len % self.sp_size != 0:
                 raise ValueError(f"max_seq_len {max_seq_len} is not divisible by sp_size {self.sp_size}")
 

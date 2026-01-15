@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import PeftAdapterMixin
@@ -57,7 +58,7 @@ class HeadAnimate(Head):
 
 class WanAnimateSelfAttention(WanSelfAttention):
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, pad_len):
         """
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -197,6 +198,7 @@ class WanAnimateAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        pad_len,
     ):
         """
         Args:
@@ -213,7 +215,7 @@ class WanAnimateAttentionBlock(nn.Module):
 
         # self-attention
         y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
+            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs, pad_len
         )
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
@@ -351,7 +353,7 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             face_pixel_values_tmp.append(self.motion_encoder.get_motion(face_pixel_values[i*encode_bs:(i+1)*encode_bs]))
 
         motion_vec = torch.cat(face_pixel_values_tmp)
-        
+
         motion_vec = rearrange(motion_vec, "(b t) c -> b t c", t=T)
         motion_vec = self.face_encoder(motion_vec)
 
@@ -399,6 +401,7 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
+        pad_len = seq_len - seq_lens.max()
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
@@ -425,11 +428,13 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             context_clip = self.img_emb(clip_fea) # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
-
         if self.use_context_parallel:
             x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
 
             cos, sin = freqs
+            if pad_len > 0:
+                cos = F.pad(cos, (0, 0, 0, 0, 0, pad_len))
+                sin = F.pad(sin, (0, 0, 0, 0, 0, pad_len))
             cos = torch.chunk(cos, get_world_size(), dim=1)[get_rank()]
             sin = torch.chunk(sin, get_world_size(), dim=1)[get_rank()]
             freqs = (cos, sin)
@@ -441,7 +446,8 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             grid_sizes=grid_sizes,
             freqs=freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            pad_len=pad_len)
 
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
