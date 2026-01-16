@@ -27,13 +27,13 @@ from sam_utils import build_sam2_video_predictor
 
 class ProcessPipeline():
     def __init__(self, det_checkpoint_path, pose2d_checkpoint_path, sam_checkpoint_path, flux_kontext_path):
-        self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path)
+        self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path, device="cpu")
 
         model_cfg = "sam2_hiera_l.yaml"
         if sam_checkpoint_path is not None:
-            self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path, device="hpu")
+            self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path, device="cpu")
         if flux_kontext_path is not None:
-            self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
+            self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cpu")
 
     def __call__(self, video_path, refer_image_path, output_path, resolution_area=[1280, 720], fps=30, iterations=3, k=7, w_len=1, h_len=1, retarget_flag=False, use_flux=False, replace_flag=False):
         if replace_flag:
@@ -315,7 +315,7 @@ class ProcessPipeline():
                 points = (keypoints_body * wh).astype(np.int32)
                 key_frame_body_points_list.append(points)
 
-            inference_state = self.predictor.init_state_v2(frames=each_frames)
+            inference_state = self.predictor.init_state_v2(frames=each_frames, offload_video_to_cpu=True, offload_state_to_cpu=True)
             self.predictor.reset_state(inference_state)
             ann_obj_id = 1
             for ann_frame_idx, points in zip(key_frame_index_list, key_frame_body_points_list):
