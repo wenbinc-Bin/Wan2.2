@@ -6,13 +6,34 @@ from torch.nn import functional as F
 import math
 import habana_frameworks.torch.core as htcore
 
-def custom_qr(input_tensor):
-    original_dtype = input_tensor.dtype
-    if original_dtype == torch.bfloat16:
-        q, r = torch.linalg.qr(input_tensor.to("cpu").to(torch.float32))
-        return q.to("hpu").to(original_dtype), r.to("hpu").to(original_dtype)
 
-    return torch.linalg.qr(input_tensor)
+def custom_qr(A):
+    """Householder变换实现QR分解，支持矩形矩阵"""
+    m, n = A.shape
+    Q = torch.eye(m, device=A.device)  # 初始化正交矩阵
+    R = A.clone()                      # 初始化上三角矩阵
+
+    for k in range(min(m, n)):
+        # 提取当前列的下半部分
+        x = R[k:, k]
+        e1 = torch.zeros_like(x)
+        e1[0] = 1
+
+        # 计算Householder向量
+        alpha = torch.sign(x[0]) * torch.norm(x)
+        u = x + alpha * e1
+        u = u / torch.norm(u)
+
+        # 构造Householder矩阵
+        H = torch.eye(m, device=A.device)
+        H[k:, k:] -= 2 * torch.outer(u, u)
+
+        # 更新R和Q
+        R = H @ R
+        Q = Q @ H.T
+
+    return Q[:, :n], R[:n, :]
+
 
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
 	return F.leaky_relu(input + bias, negative_slope) * scale
@@ -22,9 +43,7 @@ def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, 
 	_, minor, in_h, in_w = input.shape
 	kernel_h, kernel_w = kernel.shape
 
-	out = input.view(-1, minor, in_h, 1, in_w, 1)
-	out = F.pad(out, [0, up_x - 1, 0, 0, 0, up_y - 1, 0, 0])
-	out = out.view(-1, minor, in_h * up_y, in_w * up_x)
+	out = input.view(-1, minor, in_h * up_y, in_w * up_x)
 
 	out = F.pad(out, [max(pad_x0, 0), max(pad_x1, 0), max(pad_y0, 0), max(pad_y1, 0)])
 	out = out[:, :, max(-pad_y0, 0): out.shape[2] - max(-pad_y1, 0),
@@ -274,17 +293,18 @@ class Direction(nn.Module):
     def __init__(self, motion_dim):
         super(Direction, self).__init__()
         self.weight = nn.Parameter(torch.randn(512, motion_dim))
+        self.Q = None
 
     def forward(self, input):
 
-        weight = self.weight + 1e-8
-        Q, R = custom_qr(weight)
+        if self.Q is None:
+            weight = self.weight + 1e-8
+            self.Q, _ = custom_qr(weight.float())
         if input is None:
-            return Q
+            return self.Q
         else:
             input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
-            htcore.mark_step()
-            out = torch.matmul(input_diag.float(), Q.T.float())
+            out = torch.matmul(input_diag, self.Q.T.contiguous())
             out = torch.sum(out, dim=1)
             return out
 
@@ -306,7 +326,7 @@ class Generator(nn.Module):
         #motion_feat = self.enc.enc_motion(img)
         motion_feat = torch.utils.checkpoint.checkpoint((self.enc.enc_motion), img, use_reentrant=True)
 
-        with torch.autocast(device_type="hpu", dtype=torch.float32, enabled=True):
-            motion = self.dec.direction(motion_feat)
+        original_dtype = motion_feat.dtype
+        motion = self.dec.direction(motion_feat.float())
 
-        return motion
+        return motion.to(original_dtype)
