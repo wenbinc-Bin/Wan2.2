@@ -1,26 +1,24 @@
-From 8294e2fb92392d6295726f4d2c9bc35a7de7753f Mon Sep 17 00:00:00 2001
+From 0f596cfed57906b94397ff5acfb9d3bf9aa37718 Mon Sep 17 00:00:00 2001
 From: Mengkejiergeli Ba <mengkejiergeli.ba@intel.com>
 Date: Tue, 13 Jan 2026 14:31:39 +0000
 Subject: [PATCH 1/3] Add wan animate web UI demo
 
 ---
- app.py                                        | 996 ++++++++++++++++++
- generate_UI.py                                | 273 +++++
- requirements_animate.txt                      |   2 +-
- .../animate/preprocess/preprocess_data.py     |  47 +-
- .../animate/preprocess/process_pipepline.py   |  32 +-
- wan/modules/animate/preprocess/sam_utils.py   |  18 +-
- .../animate/preprocess/video_predictor.py     |   6 +-
- 7 files changed, 1358 insertions(+), 16 deletions(-)
+ app.py                                        | 1003 +++++++++++++++++
+ generate_UI.py                                |  273 +++++
+ .../animate/preprocess/preprocess_data.py     |   47 +-
+ .../animate/preprocess/process_pipepline.py   |   28 +-
+ wan/modules/animate/preprocess/sam_utils.py   |    2 +
+ 5 files changed, 1350 insertions(+), 3 deletions(-)
  create mode 100644 app.py
  create mode 100644 generate_UI.py
 
 diff --git a/app.py b/app.py
 new file mode 100644
-index 0000000..2c7e855
+index 0000000..f0c81c0
 --- /dev/null
 +++ b/app.py
-@@ -0,0 +1,996 @@
+@@ -0,0 +1,1003 @@
 +import argparse
 +import spaces
 +from huggingface_hub import snapshot_download, hf_hub_download
@@ -35,7 +33,7 @@ index 0000000..2c7e855
 +import json
 +import gradio as gr
 +import sys
-+import gc 
++import gc
 +import numpy as np
 +from gradio_modal import Modal
 +
@@ -66,10 +64,9 @@ index 0000000..2c7e855
 +def sh(cmd): subprocess.check_call(cmd, shell=True)
 +
 +
-+
 +# try:
 +
-+#     sh("pip install flash-attn --no-build-isolation")
++    # sh("pip install flash-attn --no-build-isolation")
 +    # print("Attempting to download and build sam2...")
 +
 +    # print("download sam")
@@ -86,7 +83,7 @@ index 0000000..2c7e855
 +
 +    # print("install sam")
 +    # install_sam()
-+    
++
 +    # print("Attempting to download")
 +
 +    # print("download sam")
@@ -111,13 +108,12 @@ index 0000000..2c7e855
 +
 +os.environ["PROCESSED_RESULTS"] = f"{os.getcwd()}/processed_results"
 +
-+# snapshot_download(repo_id="Wan-AI/Wan2.2-Animate-14B", local_dir="./Wan2.2-Animate-14B")
-+# wan_animate = load_model(True)
 +
 +rc_mapping = {
 +    "Video → Ref Image" : False,
 +    "Video ← Ref Image" : True
 +}
++
 +
 +def prune_prompt_dicts(pts_by_frame: dict, lbs_by_frame: dict):
 +    """Remove frames with empty/invalid clicks; keep only frames where
@@ -140,6 +136,7 @@ index 0000000..2c7e855
 +    if frame_idx not in ps["selections"]:
 +        ps["selections"][frame_idx] = {"points": [], "labels": []}
 +
++
 +def _get_points_labels_for_frame(ps, frame_idx):
 +    if "selections" not in ps or frame_idx not in ps["selections"]:
 +        return [], []
@@ -148,7 +145,7 @@ index 0000000..2c7e855
 +
 +
 +def preprocess_video(input_video_path, duration, session_id=None):
-+    
++
 +    if session_id is None:
 +        session_id = uuid.uuid4().hex
 +
@@ -161,13 +158,14 @@ index 0000000..2c7e855
 +
 +    return process_video_path
 +
++
 +def extract_audio_from_video_ffmpeg(video_path, output_wav_path, sample_rate=None):
 +    """
 +    Extracts the audio track from a video file and saves it as a WAV file.
 +    Args:
 +        video_path (str): Path to the input video file.
 +        output_wav_path (str): Path to save the extracted WAV file.
-+        sample_rate (int, optional): Output sample rate (e.g., 16000). 
++        sample_rate (int, optional): Output sample rate (e.g., 16000).
 +                                     If None, keep the original.
 +    """
 +    cmd = [
@@ -185,14 +183,14 @@ index 0000000..2c7e855
 +        cmd.extend(['-ar', str(sample_rate)])
 +
 +    cmd.append(output_wav_path)
-+    
++
 +    try:
 +        subprocess.run(cmd, check=True, capture_output=True, text=True)
 +        return True
 +    except subprocess.CalledProcessError as e:
 +        return False
 +
-+    
++
 +def combine_video_and_audio_ffmpeg(video_path, audio_path, output_video_path):
 +    """
 +    Combines a silent MP4 video with a WAV audio file into a single MP4 with sound.
@@ -211,7 +209,7 @@ index 0000000..2c7e855
 +        '-loglevel', 'error',
 +        output_video_path
 +    ]
-+    
++
 +    try:
 +        subprocess.run(cmd, check=True, capture_output=True, text=True)
 +    except subprocess.CalledProcessError as e:
@@ -247,7 +245,7 @@ index 0000000..2c7e855
 +#         "-preset", "veryfast",
 +#         "-crf", "18",
 +#         "-movflags", "+faststart",
-+#         "-c:a", "aac",   
++#         "-c:a", "aac",
 +    try:
 +        subprocess.run(cmd, check=True, capture_output=True, text=True)
 +    except subprocess.CalledProcessError as e:
@@ -261,14 +259,15 @@ index 0000000..2c7e855
 +    if not cap.isOpened():
 +        error_msg = "Cannot open video file"
 +        gr.Warning(error_msg)
-+    
++
 +    orig_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 +    orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 +    orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-+    
++
 +    cap.release()
 +
 +    return orig_width < orig_height
++
 +
 +def calculate_time_required(max_duration_s, rc_bool):
 +
@@ -287,10 +286,12 @@ index 0000000..2c7e855
 +        return 1500
 +    elif max_duration_s == 9 or  max_duration_s == 10:
 +        return 1800
-+    
++
++
 +def get_display_time_required(max_duration_s, rc_bool):
 +    # the 30 seconds extra is just for saftey in case of a unexpected slow down
 +    return calculate_time_required(max_duration_s, rc_bool)
++
 +
 +def update_time_required(max_duration_s, rc_str):
 +
@@ -298,7 +299,7 @@ index 0000000..2c7e855
 +
 +    duration_s = get_display_time_required(max_duration_s, rc_bool)
 +    duration_m = duration_s / 60
-+    
++
 +    return gr.update(value=f"⌚ Gaudi Required: ~{duration_s}.0s ({duration_m:.1f} mins)")
 +
 +
@@ -306,11 +307,10 @@ index 0000000..2c7e855
 +    return calculate_time_required(max_duration_s, rc_bool)
 +
 +
-+
 +def extract_frames(input_video, max_duration_s, session_id=None):
 +    if not input_video:
 +        raise gr.Error("Please provide an video")
-+    
++
 +    if session_id is None:
 +        session_id = uuid.uuid4().hex
 +
@@ -320,7 +320,7 @@ index 0000000..2c7e855
 +        size = (480, 832)
 +    else:
 +        size = (832, 480)
-+    
++
 +    frames = get_frames(processed_video, size)
 +
 +    output_dir = os.path.join(os.environ["PROCESSED_RESULTS"], session_id)
@@ -336,17 +336,21 @@ index 0000000..2c7e855
 +
 +    return sam_frame_path, frames, slider
 +
++
 +def set_positive(prompt_state):
 +    prompt_state["cur_label_val"] = 1.0
 +    return prompt_state
++
 +
 +def set_negative(prompt_state):
 +    prompt_state["cur_label_val"] = 0.0
 +    return prompt_state
 +
++
 +def set_sam2_mode(prompt_state, mode):
 +    prompt_state["cur_label_val"] = 1.0 if mode == "✔️Include" else 0.0
 +    return prompt_state
++
 +
 +def set_reset(prompt_state):
 +    prompt_state["selections"] = {}
@@ -373,7 +377,7 @@ index 0000000..2c7e855
 +    pts, lbs = _get_points_labels_for_frame(prompt_state, frame_idx)
 +    overlaid = draw_points(out_u, pts, lbs)
 +    return overlaid, prompt_state
-+ 
++
 +
 +def add_point(prompt_state, frames, frame_idx, i, j):
 +    _ensure_frame_bucket(prompt_state, frame_idx)
@@ -393,11 +397,12 @@ index 0000000..2c7e855
 +
 +    if not input_video:
 +        raise gr.Error("Please provide an video")
-+    
++
 +    if not edited_frame:
 +        raise gr.Error("Please provide an image")
-+    
++
 +    return Modal(visible=False)
++
 +
 +def get_sam_mask(prompt_state, frames, frame_idx, input_points, input_labels):
 +    """
@@ -410,8 +415,8 @@ index 0000000..2c7e855
 +    model_cfg = "sam2_hiera_l.yaml"
 +    ckpt_path = "/mnt/disk6/HF_models/Wan2.2-Animate-14B/process_checkpoint"
 +    sam2_checkpoint_path = os.path.join(ckpt_path, 'sam2/sam2_hiera_large.pt')
-+    
-+    video_predictor_local = build_sam2_video_predictor(model_cfg, sam2_checkpoint_path, device="cpu")    
++
++    video_predictor_local = build_sam2_video_predictor(model_cfg, sam2_checkpoint_path, device="cpu")
 +    inference_state = video_predictor_local.init_state(images=np.array(frames), device="cpu")
 +
 +    # Run point prompt
@@ -450,7 +455,7 @@ index 0000000..2c7e855
 +    #modal-container {
 +    width: 100vw;            /* Take full viewport width */
 +    height: 100vh;           /* Take full viewport height (optional) */
-+    display: flex;           
++    display: flex;
 +    justify-content: center; /* Center content horizontally */
 +    align-items: center;     /* Center content vertically if desired */
 +    }
@@ -585,11 +590,12 @@ index 0000000..2c7e855
 +
 +    if not input_video:
 +        raise gr.Error("Please provide an video")
-+    
++
 +    if not edited_frame:
 +        raise gr.Error("Please provide an image")
-+    
++
 +    return Modal(visible=True)
++
 +
 +def log_change(log_source, session_id, meta_data = None):
 +
@@ -598,18 +604,21 @@ index 0000000..2c7e855
 +    else:
 +        print(f'{session_id} changed {log_source} with {meta_data}')
 +
++
 +def start_session(request: gr.Request):
 +
 +    return request.session_hash
 +
++
 +def cleanup(request: gr.Request):
 +
 +    sid = request.session_hash
-+    
++
 +    if sid:
 +        print(f"{sid} left")
 +        d1 = os.path.join(os.environ["PROCESSED_RESULTS"], sid)
 +        shutil.rmtree(d1, ignore_errors=True)
++
 +
 +def run_gradio():
 +    # Create pipe
@@ -726,7 +735,7 @@ index 0000000..2c7e855
 +        Image.open(edited_frame).save(edited_frame_png)
 +
 +        print(f'{session_id} inference started with {rc_str} and duration of {max_duration_s}')
-+            
++
 +        preprocess_dir = _preprocess(
 +            input_video, max_duration_s, edited_frame_png, rc_bool,
 +            pts_by_frame, lbs_by_frame, session_id, progress
@@ -749,7 +758,6 @@ index 0000000..2c7e855
 +        args['process_dir'] = preprocess_dir
 +        args['replace_flag'] = rc_bool
 +
-+        
 +        broadcast_args(json.dumps(args))
 +        result_video = read_result()
 +
@@ -762,9 +770,8 @@ index 0000000..2c7e855
 +        print(f"task for {session_id} finalised")
 +        return output_video, pose_video, bg_video, mask_video, face_video
 +
-+    
 +    with gr.Blocks(css=css, title="Wan 2.2 Animate --replace", theme=gr.themes.Ocean()) as demo:
-+        
++
 +        session_state = gr.State()
 +
 +        prompt_state = gr.State({
@@ -810,11 +817,11 @@ index 0000000..2c7e855
 +                            [
 +                                "./examples/wan_animate/demo/martialart.mp4",
 +                            ],
-+                            
++
 +                            [
 +                                "./examples/wan_animate/demo/test_example.mp4",
 +                            ],
-+                    
++
 +                            [
 +                                "./examples/wan_animate/demo/dream.mp4",
 +                            ],
@@ -823,7 +830,6 @@ index 0000000..2c7e855
 +                        inputs=[input_video],
 +                        cache_examples=False,
 +                    )
-+
 +
 +                with gr.Column(elem_id="step-column"):
 +                    gr.HTML("""
@@ -873,11 +879,11 @@ index 0000000..2c7e855
 +                    output_video = gr.Video(label="Edited Video", height=512)
 +                    duration_s = get_display_time_required(2, default_replace_string)
 +                    duration_m = duration_s / 60
-+                    
++
 +                    time_required = f"⌚ Gaudi Required: ~{duration_s}.0s ({duration_m:.1f} mins)"
 +
 +                    time_required = gr.Text(value=time_required, show_label=False, visible=True)
-+                    
++
 +                    action_button = gr.Button("Wan Animate 🦆", variant='primary', elem_classes="button-gradient")
 +
 +                    with gr.Accordion("Advanced 🎭", open=False, visible=True):
@@ -891,7 +897,6 @@ index 0000000..2c7e855
 +                            face_video = gr.Video(label="Face Video")
 +                            if replace_mode:
 +                                mask_video = gr.Video(label="Mask Video")
-+                            
 +
 +            with gr.Row():
 +                with gr.Column(elem_id="col-showcase"):
@@ -991,10 +996,10 @@ index 0000000..2c7e855
 +        max_duration_slider.change(log_change, inputs=[gr.State("slider"), session_state, max_duration_slider]) \
 +            .then(update_time_required, inputs=[max_duration_slider, replace_character_string], outputs=[time_required]) \
 +            .then(extract_frames, inputs=[input_video, max_duration_slider, session_state], outputs=[first_frame, frames, frame_index])
-+        
++
 +        input_video.change(log_change, inputs=[gr.State("video"), session_state]) \
 +            .then(set_reset, inputs=[prompt_state], outputs=[prompt_state, sam2_mode_select])
-+        edited_frame.change(log_change, inputs=[gr.State("ref image"), session_state])        
++        edited_frame.change(log_change, inputs=[gr.State("ref image"), session_state])
 +
 +        adv_masking.click(log_change, inputs=[gr.State("advanced masking"), session_state]) \
 +            .then(set_reset, inputs=[prompt_state], outputs=[prompt_state, sam2_mode_select]) \
@@ -1004,7 +1009,7 @@ index 0000000..2c7e855
 +        confirm_sam2_points.click(lambda: Modal(visible=False), None, modal) \
 +                            .then(fn=animate_scene, inputs=[input_video, max_duration_slider, edited_frame, replace_character_string, prompt_state, session_state], outputs=[output_video, pose_video, face_video]) \
 +                            .then(set_reset, inputs=[prompt_state], outputs=[prompt_state, sam2_mode_select])
-+        
++
 +        sam2_mode_select.change(set_sam2_mode, [prompt_state, sam2_mode_select], [prompt_state])
 +
 +        cancel_button.click(set_reset, inputs=[prompt_state], outputs=[prompt_state, sam2_mode_select]) \
@@ -1019,7 +1024,7 @@ index 0000000..2c7e855
 +    run_gradio()
 diff --git a/generate_UI.py b/generate_UI.py
 new file mode 100644
-index 0000000..d47b3bd
+index 0000000..7e1ecdd
 --- /dev/null
 +++ b/generate_UI.py
 @@ -0,0 +1,273 @@
@@ -1196,7 +1201,7 @@ index 0000000..d47b3bd
 +    local_rank = int(os.getenv("LOCAL_RANK", 0))
 +    device = local_rank
 +    _init_logging(rank)
-+    
++
 +    if world_size > 1:
 +        torch.cuda.set_device(local_rank)
 +        dist.init_process_group(
@@ -1206,7 +1211,7 @@ index 0000000..d47b3bd
 +            world_size=world_size)
 +
 +    cfg = WAN_CONFIGS[args.task]
-+    
++
 +    if args.ulysses_size > 1:
 +        assert args.ulysses_size == world_size, f"The number of ulysses_size should be equal to the world size."
 +        init_distributed_group()
@@ -1242,7 +1247,7 @@ index 0000000..d47b3bd
 +    while(not os.path.exists(pipename)):
 +        time.sleep(1)
 +    pipe = os.open(pipename, os.O_RDONLY)
-+    
++
 +    if rank == 0:
 +        pipename = "animate_fifo_result"
 +        while(not os.path.exists(pipename)):
@@ -1297,18 +1302,6 @@ index 0000000..d47b3bd
 +    args = _parse_args()
 +    generate(args)
 \ No newline at end of file
-diff --git a/requirements_animate.txt b/requirements_animate.txt
-index 7321e55..699a156 100644
---- a/requirements_animate.txt
-+++ b/requirements_animate.txt
-@@ -3,6 +3,6 @@ peft==0.17.0
- onnxruntime
- pandas
- matplotlib
---e  git+https://github.com/HabanaAI/optimum-habana-fork/tree/aice/v1.22.0/sam2#egg=SAM-2
-+#-e  git+https://github.com/HabanaAI/optimum-habana-fork/tree/aice/v1.22.0/sam2#egg=SAM-2
- loguru
- sentencepiece
 diff --git a/wan/modules/animate/preprocess/preprocess_data.py b/wan/modules/animate/preprocess/preprocess_data.py
 index a99b0fe..e3e1c6c 100644
 --- a/wan/modules/animate/preprocess/preprocess_data.py
@@ -1372,10 +1365,10 @@ index a99b0fe..e3e1c6c 100644
 +                     use_flux=args.use_flux,
 +                     replace_flag=replace_flag)
 diff --git a/wan/modules/animate/preprocess/process_pipepline.py b/wan/modules/animate/preprocess/process_pipepline.py
-index fb82735..62d3a02 100644
+index f648e7b..5a3c846 100644
 --- a/wan/modules/animate/preprocess/process_pipepline.py
 +++ b/wan/modules/animate/preprocess/process_pipepline.py
-@@ -25,13 +25,39 @@ transformer.OLD_GPU = True
+@@ -25,6 +25,32 @@ transformer.OLD_GPU = True
  from sam_utils import build_sam2_video_predictor
  
  
@@ -1388,8 +1381,8 @@ index fb82735..62d3a02 100644
 +    # TODO: Maybe we can switch to PyAV later, which can get accurate frame num
 +    duration = video_reader.get_frame_timestamp(-1)[-1]
 +
-+    expected_frame_num = int(duration * video_fps + 0.5) 
-+    ratio = abs((frame_num - expected_frame_num)/frame_num)   
++    expected_frame_num = int(duration * video_fps + 0.5)
++    ratio = abs((frame_num - expected_frame_num)/frame_num)
 +    if ratio > 0.1:
 +        print("Warning: The difference between the actual number of frames and the expected number of frames is two large")
 +        frame_num = expected_frame_num
@@ -1407,24 +1400,7 @@ index fb82735..62d3a02 100644
 +
  class ProcessPipeline():
      def __init__(self, det_checkpoint_path, pose2d_checkpoint_path, sam_checkpoint_path, flux_kontext_path):
-         self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path)
- 
-         model_cfg = "sam2_hiera_l.yaml"
-         if sam_checkpoint_path is not None:
--            self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path, device="hpu")
-+            self.predictor = build_sam2_video_predictor(model_cfg, sam_checkpoint_path, device="cpu")
-         if flux_kontext_path is not None:
-             self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
- 
-@@ -315,7 +341,7 @@ class ProcessPipeline():
-                 points = (keypoints_body * wh).astype(np.int32)
-                 key_frame_body_points_list.append(points)
- 
--            inference_state = self.predictor.init_state_v2(frames=each_frames)
-+            inference_state = self.predictor.init_state_v2(frames=each_frames, offload_state_to_cpu=True)
-             self.predictor.reset_state(inference_state)
-             ann_obj_id = 1
-             for ann_frame_idx, points in zip(key_frame_index_list, key_frame_body_points_list):
+         self.pose2d = Pose2d(checkpoint=pose2d_checkpoint_path, detector_checkpoint=det_checkpoint_path, device="cpu")
 @@ -341,7 +367,7 @@ class ProcessPipeline():
                      all_mask.append(out_mask)
  
@@ -1435,39 +1411,9 @@ index fb82735..62d3a02 100644
          metas_list = []
          for meta in metas:
 diff --git a/wan/modules/animate/preprocess/sam_utils.py b/wan/modules/animate/preprocess/sam_utils.py
-index e5d9425..a5b4e71 100644
+index e5d9425..d44786c 100644
 --- a/wan/modules/animate/preprocess/sam_utils.py
 +++ b/wan/modules/animate/preprocess/sam_utils.py
-@@ -78,10 +78,10 @@ def load_video_frames(
-     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-     for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
-         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
--    if not offload_video_to_cpu:
--        images = images.to("hpu")
--        img_mean = img_mean.to("hpu")
--        img_std = img_std.to("hpu")
-+    # if not offload_video_to_cpu:
-+    #     images = images.to("hpu")
-+    #     img_mean = img_mean.to("hpu")
-+    #     img_std = img_std.to("hpu")
-     # normalize by mean and std
-     images -= img_mean
-     images /= img_std
-@@ -112,10 +112,10 @@ def load_video_frames_v2(
-     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-     for n, frame in enumerate(tqdm(frames, desc="video frame")):
-         images[n], video_height, video_width = _load_img_v2_as_tensor(frame, image_size)
--    if not offload_video_to_cpu:
--        images = images.to("hpu")
--        img_mean = img_mean.to("hpu")
--        img_std = img_std.to("hpu")
-+    # if not offload_video_to_cpu:
-+    #     images = images.to("hpu")
-+    #     img_mean = img_mean.to("hpu")
-+    #     img_std = img_std.to("hpu")
-     # normalize by mean and std
-     images -= img_mean
-     images /= img_std
 @@ -150,6 +150,8 @@ def build_sam2_video_predictor(
      cfg = compose(config_name=config_file, overrides=hydra_overrides)
      OmegaConf.resolve(cfg)
@@ -1477,30 +1423,6 @@ index e5d9425..a5b4e71 100644
      _load_checkpoint(model, ckpt_path)
      model = model.to(device)
      if mode == "eval":
-diff --git a/wan/modules/animate/preprocess/video_predictor.py b/wan/modules/animate/preprocess/video_predictor.py
-index ea27a55..fb8fecf 100644
---- a/wan/modules/animate/preprocess/video_predictor.py
-+++ b/wan/modules/animate/preprocess/video_predictor.py
-@@ -47,7 +47,8 @@ class SAM2VideoPredictor(_SAM2VideoPredictor):
-         # the original video height and width, used for resizing final output scores
-         inference_state["video_height"] = video_height
-         inference_state["video_width"] = video_width
--        inference_state["device"] = torch.device("hpu")
-+        inference_state["device"] = torch.device("cpu")
-+        # torch.device("hpu")
-         if offload_state_to_cpu:
-             inference_state["storage_device"] = torch.device("cpu")
-         else:
-@@ -117,7 +118,8 @@ class SAM2VideoPredictor(_SAM2VideoPredictor):
-         # the original video height and width, used for resizing final output scores
-         inference_state["video_height"] = video_height
-         inference_state["video_width"] = video_width
--        inference_state["device"] = torch.device("hpu")
-+        inference_state["device"] = torch.device("cpu")
-+        # torch.device("hpu")
-         if offload_state_to_cpu:
-             inference_state["storage_device"] = torch.device("cpu")
-         else:
 -- 
 2.43.0
 
