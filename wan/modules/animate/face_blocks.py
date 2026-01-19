@@ -336,6 +336,7 @@ class FaceBlock(nn.Module):
         motion_vec: torch.Tensor,
         motion_mask: Optional[torch.Tensor] = None,
         use_context_parallel=False,
+        pad_len=0,
     ) -> torch.Tensor:
         
         B, T, N, C = motion_vec.shape
@@ -359,8 +360,10 @@ class FaceBlock(nn.Module):
 
         if use_context_parallel:
             q = gather_forward(q, dim=1)
+            if pad_len > 0:
+                q = q[:, :-pad_len, :, :]
 
-        q = rearrange(q, "B (L S) H D -> (B L) S H D", L=T_comp)  
+        q = rearrange(q, "B (L S) H D -> (B L) S H D", L=T_comp)
         # Compute attention.
         attn = attention(
             q,
@@ -372,6 +375,8 @@ class FaceBlock(nn.Module):
 
         attn = rearrange(attn, "(B L) S C -> B (L S) C", L=T_comp)
         if use_context_parallel:
+            if pad_len > 0:
+                attn = F.pad(attn, (0, 0, 0, pad_len))
             attn = torch.chunk(attn, get_world_size(), dim=1)[get_rank()]
 
         output = self.linear2(attn)

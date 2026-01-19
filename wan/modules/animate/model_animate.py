@@ -363,9 +363,9 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         return x, motion_vec
 
 
-    def after_transformer_block(self, block_idx, x, motion_vec, motion_masks=None):
+    def after_transformer_block(self, block_idx, x, motion_vec, motion_masks=None, pad_len=0):
         if block_idx % 5 == 0:
-            adapter_args = [x, motion_vec, motion_masks, self.use_context_parallel]
+            adapter_args = [x, motion_vec, motion_masks, self.use_context_parallel, pad_len]
             residual_out = self.face_adapter.fuser_blocks[block_idx // 5](*adapter_args)
             x = residual_out + x
         return x
@@ -451,7 +451,7 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x, motion_vec)
+            x = self.after_transformer_block(idx, x, motion_vec, pad_len=pad_len)
             htcore.mark_step()
 
         # head
