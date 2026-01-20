@@ -304,6 +304,7 @@ class Direction(nn.Module):
             return self.Q
         else:
             input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
+            htcore.mark_step()
             out = torch.matmul(input_diag, self.Q.T.contiguous())
             out = torch.sum(out, dim=1)
             return out
