@@ -5,15 +5,20 @@ import math
 import random
 import numpy as np
 
+
 def get_mask_boxes(mask):
     """
 
     Args:
         mask: [h, w]
     Returns:
+        bbox: [x_min, y_min, x_max, y_max] or None if mask is empty
 
     """
     y_coords, x_coords = np.nonzero(mask)
+    if len(x_coords) == 0 or len(y_coords) == 0:
+        # Empty mask - no body detected
+        return None
     x_min = x_coords.min()
     x_max = x_coords.max()
     y_min = y_coords.min()
@@ -25,9 +30,17 @@ def get_mask_boxes(mask):
 def get_aug_mask(body_mask, w_len=10, h_len=20):
     body_bbox = get_mask_boxes(body_mask)
 
+    # Handle empty mask case - return the original mask unchanged
+    if body_bbox is None:
+        return body_mask
+
     bbox_wh = body_bbox[2:4] - body_bbox[0:2]
     w_slice = np.int32(bbox_wh[0] / w_len)
     h_slice = np.int32(bbox_wh[1] / h_len)
+
+    # Handle edge case where slice size is 0
+    if w_slice == 0 or h_slice == 0:
+        return body_mask
 
     for each_w in range(body_bbox[0], body_bbox[2], w_slice):
         w_start = min(each_w, body_bbox[2])
@@ -40,7 +53,8 @@ def get_aug_mask(body_mask, w_len=10, h_len=20):
                 body_mask[h_start:h_end, w_start:w_end] = 1
 
     return body_mask
-    
+
+
 def get_mask_body_img(img_copy, hand_mask, k=7, iterations=1):
     kernel = np.ones((k, k), np.uint8)
     dilation = cv2.dilate(hand_mask, kernel, iterations=iterations)
@@ -55,7 +69,6 @@ def get_face_bboxes(kp2ds, scale, image_shape, ratio_aug):
 
     min_x, min_y = np.min(kp2ds_face, axis=0)
     max_x, max_y = np.max(kp2ds_face, axis=0)
-
 
     initial_width = max_x - min_x
     initial_height = max_y - min_y
@@ -92,9 +105,9 @@ def calculate_new_size(orig_w, orig_h, target_area, divisor=64):
 
         if w <= 0 or h <= 0:
             return False
-        return (w * h <= target_area and  
-                w % divisor == 0 and  
-                h % divisor == 0)  
+        return (w * h <= target_area and
+                w % divisor == 0 and
+                h % divisor == 0)
 
     def get_ratio_diff(w, h):
 
@@ -151,7 +164,7 @@ def resize_by_area(image, target_area, keep_aspect_ratio=True, divisor=64, paddi
     interpolation = cv2.INTER_AREA if (new_w * new_h < w * h) else cv2.INTER_LINEAR
 
     resized_image = padding_resize(image, height=new_h, width=new_w, padding_color=padding_color,
-                                    interpolation=interpolation)
+                                   interpolation=interpolation)
     return resized_image
 
 
@@ -173,14 +186,14 @@ def padding_resize(img_ori, height=512, width=512, padding_color=(0, 0, 0), inte
         img = cv2.resize(img_ori, (new_width, height), interpolation=interpolation)
         padding = int((width - new_width) / 2)
         if len(img.shape) == 2:
-            img = img[:, :, np.newaxis]  
+            img = img[:, :, np.newaxis]
         img_pad[:, padding: padding + new_width, :] = img
     else:
         new_height = int(width / ori_width * ori_height)
         img = cv2.resize(img_ori, (width, new_height), interpolation=interpolation)
         padding = int((height - new_height) / 2)
         if len(img.shape) == 2:
-            img = img[:, :, np.newaxis]  
+            img = img[:, :, np.newaxis]
         img_pad[padding: padding + new_height, :, :] = img
 
     img_pad = np.uint8(img_pad)
