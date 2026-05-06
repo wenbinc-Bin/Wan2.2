@@ -233,7 +233,7 @@ class WanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.fav3 = FlashAttnV3Gaudi()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, pad_len=0):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -334,6 +334,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        pad_len,
     ):
         r"""
         Args:
@@ -350,7 +351,7 @@ class WanAttentionBlock(nn.Module):
 
         # self-attention
         norm_x = (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).type_as(x)
-        y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
+        y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs, pad_len)
         x = (x.float() + y * e[2].squeeze(2)).type_as(x)
         htcore.mark_step()
 
@@ -587,7 +588,8 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            pad_len=0)
 
         for block in self.blocks:
             x = block(x, **kwargs)

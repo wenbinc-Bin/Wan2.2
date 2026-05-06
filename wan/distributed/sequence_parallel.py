@@ -196,7 +196,8 @@ def sp_dit_forward(
         grid_sizes=grid_sizes,
         freqs=freqs,
         context=context,
-        context_lens=context_lens)
+        context_lens=context_lens,
+        pad_len=pad_len)
 
     for block in self.blocks:
         x = block(x, **kwargs)
