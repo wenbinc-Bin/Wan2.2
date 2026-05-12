@@ -15,6 +15,9 @@ import torch.nn as nn
 
 # Maximum representable value for torch.float8_e4m3fn.
 FP8_MAX = 448.0
+# Small epsilon used when computing per-channel / per-row FP8 scales to avoid
+# division-by-zero for all-zero rows.
+SCALE_EPSILON = 1e-8
 
 
 def dynamic_quant(data: torch.Tensor, single_scale: bool = False):
@@ -31,9 +34,9 @@ def dynamic_quant(data: torch.Tensor, single_scale: bool = False):
             when single_scale=True).
     """
     if single_scale:
-        scale = (torch.abs(data).max() + 1e-8) / FP8_MAX
+        scale = (torch.abs(data).max() + SCALE_EPSILON) / FP8_MAX
     else:
-        scale = (torch.abs(data).max(dim=-1).values + 1e-8) / FP8_MAX
+        scale = (torch.abs(data).max(dim=-1).values + SCALE_EPSILON) / FP8_MAX
         scale = scale.unsqueeze(-1)
 
     if data.device.type == 'hpu':
@@ -106,21 +109,25 @@ def _quantize_weight_to_fp8_per_channel(weight: torch.Tensor):
 
     Args:
         weight: Float weight tensor with shape ``[out_features, in_features]``.
+            May be BF16, FP16, or FP32; scale computation is done in FP32 to
+            preserve numerical accuracy.
 
     Returns:
         (weight_fp8, scale): weight_fp8 is float8_e4m3fn with the same shape
             as *weight*; scale is float32 with shape ``[out_features, 1]``.
     """
-    w_max = torch.abs(weight).max(dim=-1, keepdim=True).values
-    scale = (w_max + 1e-8) / FP8_MAX  # [out, 1], float32
+    # Compute scale in FP32 for numerical stability regardless of input dtype.
+    w_abs = weight.float().abs()
+    w_max = w_abs.max(dim=-1, keepdim=True).values
+    scale = (w_max + SCALE_EPSILON) / FP8_MAX  # [out, 1], float32
 
     if weight.device.type == 'hpu':
         weight_fp8 = torch.ops.hpu.cast_to_fp8_v2(
             weight, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]
     else:
-        weight_fp8 = (weight / scale).to(torch.float8_e4m3fn)
+        weight_fp8 = (weight.float() / scale).to(torch.float8_e4m3fn)
 
-    return weight_fp8, scale.float()
+    return weight_fp8, scale
 
 
 class WanFP8Linear(nn.Module):
@@ -145,10 +152,10 @@ class WanFP8Linear(nn.Module):
         # Precompute per-output-channel FP8 weight and scale at init time.
         # linear.weight shape: [out_features, in_features]
         weight_fp8, weight_scale = _quantize_weight_to_fp8_per_channel(
-            linear.weight.data.float())
+            linear.weight.data)
 
-        # Register as buffers so that .to(device) / .to(dtype) moves them
-        # together with the rest of the model.
+        # Register as buffers so that .to(device) moves them together with
+        # the rest of the model (e.g. when calling model.to(hpu_device)).
         self.register_buffer('weight_fp8', weight_fp8)
         self.register_buffer('weight_scale', weight_scale)
 
@@ -157,7 +164,9 @@ class WanFP8Linear(nn.Module):
         else:
             self.register_buffer('bias', None)
 
-        # Free the original BF16 weight (and bias) to save memory.
+        # Free the original BF16 weight (and bias) to reclaim memory.
+        # NOTE: after this point, the original `linear` object is left in an
+        # invalid state and must not be used.
         del linear.weight
         if linear.bias is not None:
             del linear.bias
@@ -212,7 +221,9 @@ def wrap_blocks_linear_fp8(model: nn.Module) -> None:
             child_name = parts[-1]
             linear = getattr(parent, child_name)
             if not isinstance(linear, nn.Linear):
-                # Already replaced (e.g. nested path hit twice) – skip.
+                # Guard against the unlikely case where a module has already
+                # been replaced by a previous iteration (e.g. if two paths
+                # in named_modules resolve to the same object via aliasing).
                 continue
             setattr(parent, child_name, WanFP8Linear(linear))
             wrapped_count += 1
