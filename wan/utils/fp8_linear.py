@@ -14,30 +14,25 @@ import torch
 import torch.nn as nn
 
 # Maximum representable value for torch.float8_e4m3fn.
-FP8_MAX = 448.0
+FP8_MAX = 240.0
 # Small epsilon used when computing per-channel / per-row FP8 scales to avoid
 # division-by-zero for all-zero rows.
 SCALE_EPSILON = 1e-8
 
 
-def dynamic_quant(data: torch.Tensor, single_scale: bool = False):
+def dynamic_quant(data: torch.Tensor):
     """Dynamically quantize *data* to FP8 and return (data_fp8, scale).
 
     Args:
         data: Input tensor (BF16 / FP32).
-        single_scale: When True use a single global scale; otherwise use a
-            per-row scale (last dimension treated as the feature axis).
 
     Returns:
         (data_fp8, scale): data_fp8 is float8_e4m3fn; scale is float32 and
             has the same shape as data except the last dim is 1 (or scalar
             when single_scale=True).
     """
-    if single_scale:
-        scale = (torch.abs(data).max() + SCALE_EPSILON) / FP8_MAX
-    else:
-        scale = (torch.abs(data).max(dim=-1).values + SCALE_EPSILON) / FP8_MAX
-        scale = scale.unsqueeze(-1)
+    scale = (torch.abs(data).max(dim=-1).values + SCALE_EPSILON) / FP8_MAX
+    scale = scale.unsqueeze(-1)
 
     if data.device.type == 'hpu':
         data_fp8 = torch.ops.hpu.cast_to_fp8_v2(
@@ -45,14 +40,13 @@ def dynamic_quant(data: torch.Tensor, single_scale: bool = False):
     else:
         data_fp8 = (data / scale).to(torch.float8_e4m3fn)
 
-    return data_fp8, scale.float()
+    return data_fp8, scale.float().squeeze(-1)
 
 
 def apply_fp8_linear_hpu(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    input_scale: torch.Tensor = None,
     bias: torch.Tensor = None,
     trans_B: bool = True,
 ) -> torch.Tensor:
@@ -64,8 +58,6 @@ def apply_fp8_linear_hpu(
             ``[out_features, in_features]`` (standard Linear layout).
         weight_scale: Per-output-channel dequantisation scale with shape
             ``[out_features, 1]``.
-        input_scale: Optional pre-computed activation scale.  When *None*,
-            activations are quantised dynamically (per-row).
         bias: Optional bias tensor (will be cast to the input dtype).
         trans_B: Whether to transpose B inside the GEMM.  Defaults to
             ``True`` so that the standard ``[out, in]`` weight layout works
@@ -79,13 +71,9 @@ def apply_fp8_linear_hpu(
     if len(x_shape) > 2:
         input = input.reshape(-1, x_shape[-1])
 
-    if input_scale is None:
-        x_fp8, x_scale = dynamic_quant(input)
-    else:
-        x_fp8 = torch.ops.hpu.cast_to_fp8_v2(
-            input, 1.0 / input_scale, False, False, torch.float8_e4m3fn)[0]
-        x_scale = input_scale
-
+    x_fp8, x_scale = dynamic_quant(input)
+    x_scale = x_scale.unsqueeze(-1)
+    
     output = torch.ops.hpu.fp8_gemm_v2(
         A=x_fp8,
         trans_A=False,
@@ -102,33 +90,6 @@ def apply_fp8_linear_hpu(
     if len(x_shape) > 2:
         output = output.reshape(*x_shape[:-1], -1)
     return output
-
-
-def _quantize_weight_to_fp8_per_channel(weight: torch.Tensor):
-    """Quantize *weight* to FP8 with a per-output-channel scale.
-
-    Args:
-        weight: Float weight tensor with shape ``[out_features, in_features]``.
-            May be BF16, FP16, or FP32; scale computation is done in FP32 to
-            preserve numerical accuracy.
-
-    Returns:
-        (weight_fp8, scale): weight_fp8 is float8_e4m3fn with the same shape
-            as *weight*; scale is float32 with shape ``[out_features, 1]``.
-    """
-    # Compute scale in FP32 for numerical stability regardless of input dtype.
-    w_abs = weight.float().abs()
-    w_max = w_abs.max(dim=-1, keepdim=True).values
-    scale = (w_max + SCALE_EPSILON) / FP8_MAX  # [out, 1], float32
-
-    if weight.device.type == 'hpu':
-        weight_fp8 = torch.ops.hpu.cast_to_fp8_v2(
-            weight, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]
-    else:
-        weight_fp8 = (weight.float() / scale).to(torch.float8_e4m3fn)
-
-    return weight_fp8, scale
-
 
 class WanFP8Linear(nn.Module):
     """FP8-wrapped replacement for ``torch.nn.Linear`` targeting HPU.
@@ -151,8 +112,7 @@ class WanFP8Linear(nn.Module):
 
         # Precompute per-output-channel FP8 weight and scale at init time.
         # linear.weight shape: [out_features, in_features]
-        weight_fp8, weight_scale = _quantize_weight_to_fp8_per_channel(
-            linear.weight.data)
+        weight_fp8, weight_scale = dynamic_quant(linear.weight.data)
 
         # Register as buffers so that .to(device) moves them together with
         # the rest of the model (e.g. when calling model.to(hpu_device)).
