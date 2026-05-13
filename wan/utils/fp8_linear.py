@@ -20,7 +20,7 @@ FP8_MAX = 240.0
 SCALE_EPSILON = 1e-8
 
 
-def dynamic_quant(data: torch.Tensor):
+def dynamic_quant(data: torch.Tensor, use_2d_scale=False):
     """Dynamically quantize *data* to FP8 and return (data_fp8, scale).
 
     Args:
@@ -32,7 +32,7 @@ def dynamic_quant(data: torch.Tensor):
             when single_scale=True).
     """
     scale = (torch.abs(data).max(dim=-1).values + SCALE_EPSILON) / FP8_MAX
-    scale = scale.unsqueeze(-1)
+    scale = scale.float().unsqueeze(-1)
 
     if data.device.type == 'hpu':
         data_fp8 = torch.ops.hpu.cast_to_fp8_v2(
@@ -40,7 +40,10 @@ def dynamic_quant(data: torch.Tensor):
     else:
         data_fp8 = (data / scale).to(torch.float8_e4m3fn)
 
-    return data_fp8, scale.float().squeeze(-1)
+    if not use_2d_scale:
+        scale = scale.squeeze(-1)
+
+    return data_fp8, scale
 
 
 def apply_fp8_linear_hpu(
@@ -50,7 +53,7 @@ def apply_fp8_linear_hpu(
     bias: torch.Tensor = None,
     trans_B: bool = True,
 ) -> torch.Tensor:
-    """Compute an FP8 GEMM on HPU.
+    """Compute an FP8 quant GEMM on HPU.
 
     Args:
         input: Activation tensor (BF16).  May have any leading batch dims.
@@ -71,8 +74,7 @@ def apply_fp8_linear_hpu(
     if len(x_shape) > 2:
         input = input.reshape(-1, x_shape[-1])
 
-    x_fp8, x_scale = dynamic_quant(input)
-    x_scale = x_scale.unsqueeze(-1)
+    x_fp8, x_scale = dynamic_quant(data=input, use_2d_scale=True)
     
     output = torch.ops.hpu.fp8_gemm_v2(
         A=x_fp8,
@@ -90,6 +92,50 @@ def apply_fp8_linear_hpu(
     if len(x_shape) > 2:
         output = output.reshape(*x_shape[:-1], -1)
     return output
+
+
+def apply_fp8_gemm_hpu(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor = None,
+    trans_B: bool = True,
+) -> torch.Tensor:
+    """Compute an FP8 GEMM on HPU.
+
+    Args:
+        input: Activation tensor (FP8.  May have any leading batch dims.
+        input_scale: Per-token dequantisation scale with shape
+            ``[num_token, 1]``.
+        weight: Pre-quantized FP8 weight tensor with shape
+            ``[out_features, in_features]`` (standard Linear layout).
+        weight_scale: Per-output-channel dequantisation scale with shape
+            ``[out_features, 1]``.
+        bias: Optional bias tensor (will be cast to the input dtype).
+        trans_B: Whether to transpose B inside the GEMM.  Defaults to
+            ``True`` so that the standard ``[out, in]`` weight layout works
+            with ``A @ B.T``.
+
+    Returns:
+        Output tensor with the same dtype as *input* and shape
+        ``(*leading_dims, out_features)``.
+    """
+    output = torch.ops.hpu.fp8_gemm_v2(
+        A=input,
+        trans_A=False,
+        B=weight,
+        trans_B=trans_B,
+        D=None,
+        out_dtype=torch.bfloat16,
+        A_scale_inv=input_scale,
+        B_scale_inv=weight_scale,
+        bias=bias,
+        accumulate=False,
+    )
+    
+    return output
+
 
 class WanFP8Linear(nn.Module):
     """FP8-wrapped replacement for ``torch.nn.Linear`` targeting HPU.
