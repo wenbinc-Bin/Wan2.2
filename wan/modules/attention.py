@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import math
+import os
 import torch
 
 try:
@@ -12,6 +14,12 @@ try:
     FLASH_ATTN_2_AVAILABLE = True
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
+
+try:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+    USE_FSDPA = True
+except ModuleNotFoundError:
+    print(f"Cannot find module FusedSDPA")
 
 import warnings
 
@@ -51,7 +59,7 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert q.device.type == 'hpu' and q.size(-1) <= 256
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
@@ -168,12 +176,121 @@ def attention(
             )
         attn_mask = None
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
+        q = q.transpose(1, 2).to(dtype).contiguous()
+        k = k.transpose(1, 2).to(dtype).contiguous()
+        v = v.transpose(1, 2).to(dtype).contiguous()
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+        if USE_FSDPA:
+            out = FusedSDPA.apply(q, k, v, attn_mask, dropout_p, causal, None, "fast")
+        else:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
         out = out.transpose(1, 2).contiguous()
         return out
+
+
+class FlashAttnV3Gaudi:
+    def __init__ (self):
+        self.q_chunk = int(os.environ.get("FA3_Q_CHUNK", 8192))
+        self.kv_chunk = int(os.environ.get("FA3_KV_CHUNK", 8192))
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        fsdpa_mode: str = "fast",
+        cp_size: int = 1,
+        pad_len: int = 0,
+        layout_head_first: bool = False,
+        ) -> torch.Tensor:
+
+        # Change to (batch, heads, seq_len, head_dim)
+        if not layout_head_first:
+            query, key, value = (x.permute(0, 2, 1, 3).contiguous() for x in (query, key, value))
+        query_len = query.size(-2)
+        key_len = key.size(-2)
+
+        # In the case of cross-attn, use FusedSDPA.
+        if  (query_len * cp_size) != key_len or (query_len <= 8192 and key_len <= 8192):
+            output = FusedSDPA.apply(
+                query,
+                key,
+                value,
+                attention_mask,
+                0.0,
+                False,
+                None,
+                fsdpa_mode,
+                None
+            )
+            return output.permute(0, 2, 1, 3).contiguous() if not layout_head_first else output
+
+        #Flash Attention V3 for Full Attention
+        linv_factor = 128.0 if fsdpa_mode == "fast" else 1.0
+
+        if pad_len > 0:
+            key = key[:, :, :-pad_len, :]
+            value = value[:, :, :-pad_len, :]
+            key_len = key.size(-2)
+
+        num_query_chunk = int((query_len - 1) / self.q_chunk) + 1
+        num_kv_chunk = int((key_len - 1) / self.kv_chunk) + 1
+
+        final_hidden_list = []
+
+        for query_idx in range(num_query_chunk):
+
+            query_start = query_idx * self.q_chunk
+            query_end = (query_idx + 1) * self.q_chunk if query_idx < num_query_chunk - 1 else query_len
+            query_slice = query[..., query_start:query_end, :]
+
+            out = None
+            m = None
+            linv = None
+
+            for kv_idx in range(num_kv_chunk):
+
+                kv_start = kv_idx * self.kv_chunk
+                kv_end = (kv_idx + 1) * self.kv_chunk if kv_idx < num_kv_chunk - 1 else key_len
+
+                key_slice = key[..., kv_start:kv_end, :]
+                value_slice = value[..., kv_start:kv_end, :]
+
+                block_out, block_m, block_linv, _ = torch.ops.hpu.sdpa_recomp_fwd(
+                    query_slice,
+                    key_slice,
+                    value_slice,
+                    None,
+                    0.0,
+                    1 / math.sqrt(query.shape[-1]),
+                    False,
+                    True,
+                    fsdpa_mode,
+                    None, #vsl,
+                    "left",
+                )
+
+                if kv_idx == 0:
+                    out = block_out.to(torch.float32)
+                    m = block_m.to(torch.float32)
+                    linv = block_linv.to(torch.float32) * linv_factor
+                else:
+                    block_linv = block_linv.to(torch.float32) * linv_factor
+                    block_m = block_m.to(torch.float32)
+                    block_out = block_out.to(torch.float32)
+                    new_m = torch.maximum(m, block_m)
+                    l_rescaled = (1.0 / linv) * torch.exp(m - new_m)
+                    block_l_rescaled = (1.0 / block_linv) * torch.exp(block_m - new_m)
+                    new_linv = 1.0 / (l_rescaled + block_l_rescaled)
+                    out = (l_rescaled * new_linv) * out + (block_l_rescaled * new_linv) * block_out
+                    linv = new_linv
+                    m = new_m
+
+            final_hidden_list.append(out.to(query.dtype))
+
+        output = torch.cat(final_hidden_list, dim=-2)
+
+        return output.permute(0, 2, 1, 3).contiguous() if not layout_head_first else output

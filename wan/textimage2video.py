@@ -22,6 +22,7 @@ from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
+from .utils.fp8_linear import wrap_blocks_linear_fp8
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -45,6 +46,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        fp8=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -71,12 +73,19 @@ class WanTI2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            fp8 (`bool`, *optional*, defaults to False):
+                Enable FP8 Linear GEMM for transformer blocks on HPU.  When
+                True, all ``nn.Linear`` layers inside ``model.blocks`` are
+                wrapped with :class:`WanFP8Linear` at initialisation time:
+                weights are compressed to per-output-channel FP8 and the
+                original BF16 weights are freed.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device("hpu")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.fp8 = fp8
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -106,7 +115,8 @@ class WanTI2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            fp8=fp8)
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -116,7 +126,7 @@ class WanTI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, fp8=False):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -133,12 +143,17 @@ class WanTI2V:
             convert_model_dtype (`bool`):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            fp8 (`bool`, *optional*, defaults to False):
+                Wrap Linear layers inside model.blocks with WanFP8Linear.
 
         Returns:
             torch.nn.Module:
                 The configured model.
         """
         model.eval().requires_grad_(False)
+
+        if fp8:
+            wrap_blocks_linear_fp8(model)
 
         if use_sp:
             for block in model.blocks:
@@ -293,7 +308,7 @@ class WanTI2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
+        seed_g = torch.Generator("cpu")
         seed_g.manual_seed(seed)
 
         if not self.t5_cpu:
@@ -364,11 +379,13 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for _ in tqdm(range(len(timesteps))):
+                t = timesteps[0]
+                timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                 latent_model_input = latents
                 timestep = [t]
 
-                timestep = torch.stack(timestep)
+                timestep = torch.stack(timestep).to(self.device)
 
                 temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
                 temp_ts = torch.cat([
@@ -483,7 +500,7 @@ class WanTI2V:
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
+        seed_g = torch.Generator("cpu")
         seed_g.manual_seed(seed)
         noise = torch.randn(
             self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
@@ -564,7 +581,9 @@ class WanTI2V:
                 self.model.to(self.device)
                 torch.cuda.empty_cache()
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for _ in tqdm(range(len(timesteps))):
+                t = timesteps[0]
+                timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
