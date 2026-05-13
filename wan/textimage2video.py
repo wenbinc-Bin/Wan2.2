@@ -152,6 +152,9 @@ class WanTI2V:
         """
         model.eval().requires_grad_(False)
 
+        if convert_model_dtype:
+            model.to(self.param_dtype)
+
         if fp8:
             wrap_blocks_linear_fp8(model)
 
@@ -167,8 +170,6 @@ class WanTI2V:
         if dit_fsdp:
             model = shard_fn(model)
         else:
-            if convert_model_dtype:
-                model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
 
