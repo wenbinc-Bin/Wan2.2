@@ -30,7 +30,7 @@ from ..model import (
     sinusoidal_embedding_1d,
 )
 from ..attention import attention
-from ..utils.fp8_linear import dynamic_quant, apply_fp8_gemm_hpu
+from ...utils.fp8_linear import dynamic_quant, apply_fp8_gemm_hpu
 from .audio_utils import AudioInjector_WAN, CausalAudioEncoder
 from .motioner import FramePackMotioner, MotionerTransformers
 from .s2v_utils import rope_precompute
