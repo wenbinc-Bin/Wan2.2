@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
+from ..utils.fp8_linear import dynamic_quant, apply_fp8_gemm_hpu
 
 import habana_frameworks.torch.core as htcore
 from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
