@@ -82,7 +82,7 @@ def apply_fp8_linear_hpu(
         B=weight,
         trans_B=trans_B,
         D=None,
-        out_dtype=input.dtype,
+        out_dtype=torch.bfloat16,
         A_scale_inv=x_scale,
         B_scale_inv=weight_scale,
         bias=bias,
