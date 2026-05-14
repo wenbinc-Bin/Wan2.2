@@ -125,8 +125,7 @@ class WanS2V:
         if not dit_fsdp:
             self.noise_model = WanModel_S2V.from_pretrained(
                 checkpoint_dir,
-                torch_dtype=self.param_dtype,
-                device_map=self.device)
+                torch_dtype=self.param_dtype)
         else:
             self.noise_model = WanModel_S2V.from_pretrained(
                 checkpoint_dir, torch_dtype=self.param_dtype)
