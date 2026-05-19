@@ -21,6 +21,13 @@ from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
 from .utils.fp8_linear import wrap_blocks_linear_fp8
+from .utils.model_memory import (
+    clear_device_cache,
+    load_wan_model_low_cpu_mem,
+    module_device,
+    move_module_to_device,
+    synchronize_device,
+)
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -107,8 +114,12 @@ class WanT2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint)
+        load_dtype = self.param_dtype if (convert_model_dtype or fp8) else None
+        self.low_noise_model = load_wan_model_low_cpu_mem(
+            WanModel,
+            checkpoint_dir,
+            subfolder=config.low_noise_checkpoint,
+            torch_dtype=load_dtype)
         self.low_noise_model = self._configure_model(
             model=self.low_noise_model,
             use_sp=use_sp,
@@ -116,9 +127,13 @@ class WanT2V:
             shard_fn=shard_fn,
             convert_model_dtype=convert_model_dtype,
             fp8=fp8)
+        clear_device_cache(torch.device('cpu'))
 
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint)
+        self.high_noise_model = load_wan_model_low_cpu_mem(
+            WanModel,
+            checkpoint_dir,
+            subfolder=config.high_noise_checkpoint,
+            torch_dtype=load_dtype)
         self.high_noise_model = self._configure_model(
             model=self.high_noise_model,
             use_sp=use_sp,
@@ -160,7 +175,7 @@ class WanT2V:
         """
         model.eval().requires_grad_(False)
 
-        if convert_model_dtype:
+        if convert_model_dtype and next(model.parameters()).dtype != self.param_dtype:
             model.to(self.param_dtype)
 
         if fp8:
@@ -179,7 +194,7 @@ class WanT2V:
             model = shard_fn(model)
         else:
             if not self.init_on_cpu:
-                model.to(self.device)
+                move_module_to_device(model, self.device)
 
         return model
 
@@ -207,14 +222,14 @@ class WanT2V:
             required_model_name = 'low_noise_model'
             offload_model_name = 'high_noise_model'
         if offload_model or self.init_on_cpu:
-            if next(getattr(
-                    self,
-                    offload_model_name).parameters()).device.type == 'cuda':
-                getattr(self, offload_model_name).to('cpu')
-            if next(getattr(
-                    self,
-                    required_model_name).parameters()).device.type == 'cpu':
-                getattr(self, required_model_name).to(self.device)
+            offload_model_obj = getattr(self, offload_model_name)
+            required_model_obj = getattr(self, required_model_name)
+            if module_device(offload_model_obj).type == self.device.type:
+                offload_model_obj.to('cpu')
+                synchronize_device(self.device)
+                clear_device_cache(self.device)
+            if module_device(required_model_obj).type == 'cpu':
+                move_module_to_device(required_model_obj, self.device)
         return getattr(self, required_model_name)
 
     def generate(self,
@@ -382,7 +397,7 @@ class WanT2V:
             if offload_model:
                 self.low_noise_model.cpu()
                 self.high_noise_model.cpu()
-                torch.cuda.empty_cache()
+                clear_device_cache(self.device)
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 
@@ -390,7 +405,7 @@ class WanT2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            synchronize_device(self.device)
         if dist.is_initialized():
             dist.barrier()
 

@@ -23,6 +23,12 @@ from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fp8_linear import wrap_blocks_linear_fp8
+from .utils.model_memory import (
+    clear_device_cache,
+    load_wan_model_low_cpu_mem,
+    move_module_to_device,
+    synchronize_device,
+)
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -109,7 +115,9 @@ class WanTI2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        load_dtype = self.param_dtype if (convert_model_dtype or fp8) else None
+        self.model = load_wan_model_low_cpu_mem(
+            WanModel, checkpoint_dir, torch_dtype=load_dtype)
         self.model = self._configure_model(
             model=self.model,
             use_sp=use_sp,
@@ -152,7 +160,7 @@ class WanTI2V:
         """
         model.eval().requires_grad_(False)
 
-        if convert_model_dtype:
+        if convert_model_dtype and next(model.parameters()).dtype != self.param_dtype:
             model.to(self.param_dtype)
 
         if fp8:
@@ -171,7 +179,7 @@ class WanTI2V:
             model = shard_fn(model)
         else:
             if not self.init_on_cpu:
-                model.to(self.device)
+                move_module_to_device(model, self.device)
 
         return model
 
@@ -377,8 +385,8 @@ class WanTI2V:
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
             if offload_model or self.init_on_cpu:
-                self.model.to(self.device)
-                torch.cuda.empty_cache()
+                move_module_to_device(self.model, self.device)
+                clear_device_cache(self.device)
 
             for _ in tqdm(range(len(timesteps))):
                 t = timesteps[0]
@@ -413,8 +421,8 @@ class WanTI2V:
             x0 = latents
             if offload_model:
                 self.model.cpu()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                synchronize_device(self.device)
+                clear_device_cache(self.device)
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 
@@ -422,7 +430,7 @@ class WanTI2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            synchronize_device(self.device)
         if dist.is_initialized():
             dist.barrier()
 
@@ -579,8 +587,8 @@ class WanTI2V:
             }
 
             if offload_model or self.init_on_cpu:
-                self.model.to(self.device)
-                torch.cuda.empty_cache()
+                move_module_to_device(self.model, self.device)
+                clear_device_cache(self.device)
 
             for _ in tqdm(range(len(timesteps))):
                 t = timesteps[0]
@@ -600,11 +608,11 @@ class WanTI2V:
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
-                    torch.cuda.empty_cache()
+                    clear_device_cache(self.device)
                 noise_pred_uncond = self.model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
-                    torch.cuda.empty_cache()
+                    clear_device_cache(self.device)
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
 
@@ -622,8 +630,8 @@ class WanTI2V:
 
             if offload_model:
                 self.model.cpu()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                synchronize_device(self.device)
+                clear_device_cache(self.device)
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)
@@ -632,7 +640,7 @@ class WanTI2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            synchronize_device(self.device)
         if dist.is_initialized():
             dist.barrier()
 

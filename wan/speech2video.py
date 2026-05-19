@@ -30,6 +30,12 @@ from .modules.s2v.model_s2v import WanModel_S2V, sp_attn_forward_s2v
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
 from .utils.fp8_linear import wrap_blocks_linear_fp8
+from .utils.model_memory import (
+    clear_device_cache,
+    load_wan_model_low_cpu_mem,
+    move_module_to_device,
+    synchronize_device,
+)
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -122,13 +128,8 @@ class WanS2V:
             device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        if not dit_fsdp:
-            self.noise_model = WanModel_S2V.from_pretrained(
-                checkpoint_dir,
-                torch_dtype=self.param_dtype)
-        else:
-            self.noise_model = WanModel_S2V.from_pretrained(
-                checkpoint_dir, torch_dtype=self.param_dtype)
+        self.noise_model = load_wan_model_low_cpu_mem(
+            WanModel_S2V, checkpoint_dir, torch_dtype=self.param_dtype)
 
         self.noise_model = self._configure_model(
             model=self.noise_model,
@@ -180,7 +181,7 @@ class WanS2V:
         """
         model.eval().requires_grad_(False)
 
-        if convert_model_dtype:
+        if convert_model_dtype and next(model.parameters()).dtype != self.param_dtype:
             model.to(self.param_dtype)
 
         if fp8:
@@ -199,7 +200,7 @@ class WanS2V:
             model = shard_fn(model)
         else:
             if not self.init_on_cpu:
-                model.to(self.device)
+                move_module_to_device(model, self.device)
 
         return model
 
@@ -630,8 +631,8 @@ class WanS2V:
                     }
                     arg_null = self.noise_model.pre_loop(latents[0:1], **arg_null)
                 if offload_model or self.init_on_cpu:
-                    self.noise_model.to(self.device)
-                    torch.cuda.empty_cache()
+                    move_module_to_device(self.noise_model, self.device)
+                    clear_device_cache(self.device)
                 htcore.mark_step()
                 for _ in tqdm(range(len(timesteps))):
                     t = timesteps[0]
@@ -665,8 +666,8 @@ class WanS2V:
 
                 if offload_model:
                     self.noise_model.cpu()
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+                    synchronize_device(self.device)
+                    clear_device_cache(self.device)
                 latents = torch.stack(latents)
                 if not (drop_first_motion and r == 0):
                     decode_latents = torch.cat([motion_latents, latents], dim=2)
@@ -694,7 +695,7 @@ class WanS2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            synchronize_device(self.device)
         if dist.is_initialized():
             dist.barrier()
 
