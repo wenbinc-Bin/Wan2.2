@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import PeftAdapterMixin
@@ -27,14 +28,18 @@ from ..model import (
     WanRMSNorm,
     WanModel,
     WanSelfAttention,
-    flash_attention,
-    rope_params,
+    attention,
+    rope_params_gaudi,
     sinusoidal_embedding_1d,
-    rope_apply
+    WanRotaryPosEmbed,
+    rope_apply_gaudi
 )
 
 from .face_blocks import FaceEncoder, FaceAdapter
 from .motion_encoder import Generator
+import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
+
 
 class HeadAnimate(Head):
 
@@ -53,7 +58,7 @@ class HeadAnimate(Head):
 
 class WanAnimateSelfAttention(WanSelfAttention):
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, pad_len):
         """
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -72,12 +77,11 @@ class WanAnimateSelfAttention(WanSelfAttention):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+        k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+
+        x = self.fav3.forward(q, k, v)
+        htcore.mark_step()
 
         # output
         x = x.flatten(2)
@@ -131,9 +135,9 @@ class WanAnimateCrossAttention(WanSelfAttention):
         if self.use_img_emb:
             k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
             v_img = self.v_img(context_img).view(b, -1, n, d)
-            img_x = flash_attention(q, k_img, v_img, k_lens=None)
+            img_x = self.fav3.forward(q, k_img, v_img)
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = self.fav3.forward(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -194,6 +198,7 @@ class WanAnimateAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        pad_len,
     ):
         """
         Args:
@@ -210,7 +215,7 @@ class WanAnimateAttentionBlock(nn.Module):
 
         # self-attention
         y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
+            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs, pad_len
         )
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
@@ -313,11 +318,8 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ], dim=1)
+
+        self.rope = WanRotaryPosEmbed(d, patch_size)
 
         self.img_emb = MLPProj(1280, dim)
         
@@ -351,7 +353,7 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             face_pixel_values_tmp.append(self.motion_encoder.get_motion(face_pixel_values[i*encode_bs:(i+1)*encode_bs]))
 
         motion_vec = torch.cat(face_pixel_values_tmp)
-        
+
         motion_vec = rearrange(motion_vec, "(b t) c -> b t c", t=T)
         motion_vec = self.face_encoder(motion_vec)
 
@@ -361,9 +363,9 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         return x, motion_vec
 
 
-    def after_transformer_block(self, block_idx, x, motion_vec, motion_masks=None):
+    def after_transformer_block(self, block_idx, x, motion_vec, motion_masks=None, pad_len=0):
         if block_idx % 5 == 0:
-            adapter_args = [x, motion_vec, motion_masks, self.use_context_parallel]
+            adapter_args = [x, motion_vec, motion_masks, self.use_context_parallel, pad_len]
             residual_out = self.face_adapter.fuser_blocks[block_idx // 5](*adapter_args)
             x = residual_out + x
         return x
@@ -382,11 +384,13 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     ):
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
+        #if self.freqs.device != device:
+        #    self.freqs = self.freqs.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        freqs = self.rope(x[0])
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -397,6 +401,7 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
+        pad_len = seq_len - seq_lens.max()
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
@@ -406,8 +411,8 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float()
-            )
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            ).float()
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim)).float()
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
@@ -423,21 +428,31 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             context_clip = self.img_emb(clip_fea) # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
+        if self.use_context_parallel:
+            x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
+
+            cos, sin = freqs
+            if pad_len > 0:
+                cos = F.pad(cos, (0, 0, 0, 0, 0, pad_len))
+                sin = F.pad(sin, (0, 0, 0, 0, 0, pad_len))
+            cos = torch.chunk(cos, get_world_size(), dim=1)[get_rank()]
+            sin = torch.chunk(sin, get_world_size(), dim=1)[get_rank()]
+            freqs = (cos, sin)
+
         # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.freqs,
+            freqs=freqs,
             context=context,
-            context_lens=context_lens)
-
-        if self.use_context_parallel:
-            x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
+            context_lens=context_lens,
+            pad_len=pad_len)
 
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
-            x = self.after_transformer_block(idx, x, motion_vec)
+            x = self.after_transformer_block(idx, x, motion_vec, pad_len=pad_len)
+            htcore.mark_step()
 
         # head
         x = self.head(x, e)

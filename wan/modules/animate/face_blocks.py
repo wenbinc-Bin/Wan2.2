@@ -13,6 +13,8 @@ try:
 except ImportError:
     flash_attn_func = None
 
+from ..attention import FlashAttnV3Gaudi
+
 MEMORY_LAYOUT = {
     "flash": (
         lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
@@ -70,12 +72,9 @@ def attention(
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal)
 
     elif mode == "flash":
-        x = flash_attn_func(
-            q,
-            k,
-            v,
-        )
-        x = x.view(batch_size, max_seqlen_q, x.shape[-2], x.shape[-1])  # reshape x to [b, s, a, d]
+        fav3 = FlashAttnV3Gaudi()
+        x = fav3.forward(q, k, v)
+        x = x.reshape(batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]) # reshape x to [b, s, a, d]
     elif mode == "vanilla":
         scale_factor = 1 / math.sqrt(q.size(-1))
 
@@ -337,6 +336,7 @@ class FaceBlock(nn.Module):
         motion_vec: torch.Tensor,
         motion_mask: Optional[torch.Tensor] = None,
         use_context_parallel=False,
+        pad_len=0,
     ) -> torch.Tensor:
         
         B, T, N, C = motion_vec.shape
@@ -360,8 +360,10 @@ class FaceBlock(nn.Module):
 
         if use_context_parallel:
             q = gather_forward(q, dim=1)
+            if pad_len > 0:
+                q = q[:, :-pad_len, :, :]
 
-        q = rearrange(q, "B (L S) H D -> (B L) S H D", L=T_comp)  
+        q = rearrange(q, "B (L S) H D -> (B L) S H D", L=T_comp)
         # Compute attention.
         attn = attention(
             q,
@@ -373,6 +375,8 @@ class FaceBlock(nn.Module):
 
         attn = rearrange(attn, "(B L) S C -> B (L S) C", L=T_comp)
         if use_context_parallel:
+            if pad_len > 0:
+                attn = F.pad(attn, (0, 0, 0, pad_len))
             attn = torch.chunk(attn, get_world_size(), dim=1)[get_rank()]
 
         output = self.linear2(attn)

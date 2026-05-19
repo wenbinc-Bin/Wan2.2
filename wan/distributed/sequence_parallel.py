@@ -1,10 +1,15 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
 import torch.cuda.amp as amp
+import torch.nn.functional as F
 
 from ..modules.model import sinusoidal_embedding_1d
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
+from ..utils.fp8_linear import dynamic_quant, apply_fp8_gemm_hpu
+
+import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
 
 
 def pad_freqs(original_tensor, target_len):
@@ -61,6 +66,61 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
+def rope_apply_gaudi(x, grid_sizes, freqs):
+    """
+    x:          [B, L, N, C].
+    grid_sizes: [B, 3].
+    freqs:      [M, C // 2].
+    """
+    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    cos, sin = freqs
+    cos = cos.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    sin = sin.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        x_i = x.to(torch.float64).reshape(s, n, -1, 2)
+        x_real, x_imag = x_i.unbind(-1)  # [B, S, H, D//2]
+        x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+
+        cos_i = torch.cat([
+            cos[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            cos[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            cos[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        sin_i = torch.cat([
+            sin[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            sin[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            sin[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        cos_i = cos_i.to(device=x.device)
+        sin_i = sin_i.to(device=x.device)
+
+        sp_size = get_world_size()
+        sp_rank = get_rank()
+        cos_i = pad_freqs(cos_i, s * sp_size)
+        sin_i = pad_freqs(sin_i, s * sp_size)
+
+        s_per_rank = s
+        cos_i_rank = cos_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+                                                       s_per_rank), :, :]
+        sin_i_rank = sin_i[(sp_rank * s_per_rank):((sp_rank + 1) *
+                                                       s_per_rank), :, :]
+
+        cos_i_rank = torch.repeat_interleave(cos_i_rank, 2, dim=2).reshape(s, 1, -1, 2)
+        sin_i_rank = torch.repeat_interleave(sin_i_rank, 2, dim=2).reshape(s, 1, -1, 2)
+
+        x_i = (x_i.float() * cos_i_rank + x_rotated.float() * sin_i_rank).flatten(2).to(x.dtype)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        output.append(x_i)
+    return torch.stack(output)
+
+
 def sp_dit_forward(
     self,
     x,
@@ -78,11 +138,11 @@ def sp_dit_forward(
         assert y is not None
     # params
     device = self.patch_embedding.weight.device
-    if self.freqs.device != device:
-        self.freqs = self.freqs.to(device)
 
     if y is not None:
         x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+    freqs = self.rope(x[0])
 
     # embeddings
     x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -91,6 +151,7 @@ def sp_dit_forward(
     x = [u.flatten(2).transpose(1, 2) for u in x]
     seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
     assert seq_lens.max() <= seq_len
+    pad_len = seq_len - seq_lens.max()
     x = torch.cat([
         torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1)
         for u in x
@@ -99,7 +160,7 @@ def sp_dit_forward(
     # time embeddings
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
+    with torch.autocast(device_type="hpu", dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
         e = self.time_embedding(
@@ -121,17 +182,27 @@ def sp_dit_forward(
     e = torch.chunk(e, get_world_size(), dim=1)[get_rank()]
     e0 = torch.chunk(e0, get_world_size(), dim=1)[get_rank()]
 
+    cos, sin = freqs
+    if pad_len > 0:
+        cos = F.pad(cos, (0, 0, 0, 0, 0, pad_len))
+        sin = F.pad(sin, (0, 0, 0, 0, 0, pad_len))
+    cos = torch.chunk(cos, get_world_size(), dim=1)[get_rank()]
+    sin = torch.chunk(sin, get_world_size(), dim=1)[get_rank()]
+    freqs = (cos, sin)
+
     # arguments
     kwargs = dict(
         e=e0,
         seq_lens=seq_lens,
         grid_sizes=grid_sizes,
-        freqs=self.freqs,
+        freqs=freqs,
         context=context,
-        context_lens=context_lens)
+        context_lens=context_lens,
+        pad_len=pad_len)
 
     for block in self.blocks:
         x = block(x, **kwargs)
+        htcore.mark_step()
 
     # head
     x = self.head(x, e)
@@ -144,7 +215,7 @@ def sp_dit_forward(
     return [u.float() for u in x]
 
 
-def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
+def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, pad_len, dtype=torch.bfloat16):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
@@ -157,18 +228,51 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
         return q, k, v
+    def qkv_fp8_fn(x):
+        x_fp8, x_scale = dynamic_quant(x, use_2d_scale=True)
+        q = apply_fp8_gemm_hpu(
+            input=x_fp8,
+            input_scale=x_scale,
+            weight=self.q.weight_fp8,
+            weight_scale=self.q.weight_scale,
+            bias=self.q.bias,
+        )
+        k = apply_fp8_gemm_hpu(
+            input=x_fp8,
+            input_scale=x_scale,
+            weight=self.k.weight_fp8,
+            weight_scale=self.k.weight_scale,
+            bias=self.k.bias,
+        )
+        v = apply_fp8_gemm_hpu(
+            input=x_fp8,
+            input_scale=x_scale,
+            weight=self.v.weight_fp8,
+            weight_scale=self.v.weight_scale,
+            bias=self.v.bias,
+        )
+        q = self.norm_q(q).reshape(b, s, n, d)
+        k = self.norm_k(k).reshape(b, s, n, d)
+        v = v.reshape(b, s, n, d)
+        return q, k, v
 
-    q, k, v = qkv_fn(x)
-    q = rope_apply(q, grid_sizes, freqs)
-    k = rope_apply(k, grid_sizes, freqs)
+    if hasattr(self.q, "weight"):
+        q, k, v = qkv_fn(x)
+    else:
+        q, k, v = qkv_fp8_fn(x)
 
-    x = distributed_attention(
-        half(q),
-        half(k),
-        half(v),
-        seq_lens,
-        window_size=self.window_size,
-    )
+    q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+    k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+
+    # Gather K/V for sequence parallel
+    k = gather_forward(k, dim=1)
+    v = gather_forward(v, dim=1)
+
+    cp_size = get_world_size()
+    x = self.fav3.forward(half(q), half(k), half(v), cp_size=cp_size, pad_len=pad_len)
+
+    if cp_size > 1:
+        torch.hpu.synchronize()
 
     # output
     x = x.flatten(2)

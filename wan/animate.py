@@ -30,6 +30,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+import habana_frameworks.torch.core as htcore
 
 
 
@@ -77,7 +78,7 @@ class WanAnimate:
             use_relighting_lora (`bool`, *optional*, defaults to False):
                Whether to use relighting lora for character replacement. 
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device("hpu")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -100,7 +101,7 @@ class WanAnimate:
         )
 
         self.clip = CLIPModel(
-            dtype=torch.float16,
+            dtype=torch.bfloat16,
             device=self.device,
             checkpoint_path=os.path.join(checkpoint_dir,
                                          config.clip_checkpoint),
@@ -350,7 +351,7 @@ class WanAnimate:
         """
         assert refert_num == 1 or refert_num == 5, "refert_num should be 1 or 5."
 
-        seed_g = torch.Generator(device=self.device)
+        seed_g = torch.Generator("cpu")
         seed_g.manual_seed(seed)
 
         if n_prompt == "":
@@ -469,12 +470,13 @@ class WanAnimate:
                     target_shape[1],
                     target_shape[2],
                     dtype=torch.float32,
-                    device=self.device,
+                    device="cpu",
                     generator=seed_g,
-                )
+                ).to(self.device)
             ]
-        
+
             max_seq_len = int(math.ceil(np.prod(target_shape) // 4 / self.sp_size)) * self.sp_size
+
             if max_seq_len % self.sp_size != 0:
                 raise ValueError(f"max_seq_len {max_seq_len} is not divisible by sp_size {self.sp_size}")
 
@@ -600,11 +602,15 @@ class WanAnimate:
                         "face_pixel_values": face_pixel_values_uncond,
                     }
 
-                for i, t in enumerate(tqdm(timesteps)):
+                htcore.mark_step()
+
+                for _ in tqdm(range(len(timesteps))):
+                    t = timesteps[0]
+                    timesteps = torch.roll(timesteps, shifts=-1, dims=0)
                     latent_model_input = latents
                     timestep = [t]
 
-                    timestep = torch.stack(timestep)
+                    timestep = torch.stack(timestep).to(self.device)
 
                     noise_pred_cond = TensorList(
                          self.noise_model(TensorList(latent_model_input), t=timestep, **arg_c)
@@ -621,6 +627,7 @@ class WanAnimate:
                         )
                     else:
                         noise_pred = noise_pred_cond
+                    htcore.mark_step()
 
                     temp_x0 = sample_scheduler.step(
                         noise_pred[0].unsqueeze(0),
@@ -630,8 +637,10 @@ class WanAnimate:
                         generator=seed_g,
                     )[0]
                     latents[0] = temp_x0.squeeze(0)
+                    htcore.mark_step()
 
                     x0 = latents
+                    htcore.mark_step()
 
                 x0 = [x.to(dtype=torch.float32) for x in x0]
                 out_frames = torch.stack(self.vae.decode([x0[0][:, 1:]]))

@@ -1,12 +1,16 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from .attention import flash_attention, attention, FlashAttnV3Gaudi
+from ..utils.fp8_linear import dynamic_quant, apply_fp8_gemm_hpu
+import habana_frameworks.torch.core as htcore
+from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
 
 __all__ = ['WanModel']
 
@@ -33,6 +37,22 @@ def rope_params(max_seq_len, dim, theta=10000):
                         torch.arange(0, dim, 2).to(torch.float64).div(dim)))
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
+
+
+def rope_params_gaudi(max_seq_len, dim, theta=10000):
+    assert dim % 2 == 0
+    freqs = torch.outer(
+        torch.arange(max_seq_len),
+        1.0 / torch.pow(theta,
+                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
+
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+
+    cos = torch.repeat_interleave(cos, 2, dim=1)
+    sin = torch.repeat_interleave(sin, 2, dim=1)
+
+    return cos, sin
 
 
 @torch.amp.autocast('cuda', enabled=False)
@@ -66,6 +86,44 @@ def rope_apply(x, grid_sizes, freqs):
     return torch.stack(output).float()
 
 
+def rope_apply_gaudi(x, grid_sizes, freqs):
+    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    cos, sin = freqs
+    cos = cos.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    sin = sin.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+
+        x_i = x.to(torch.float64).reshape(s, n, -1, 2)
+        x_real, x_imag = x_i.unbind(-1)  # [B, S, H, D//2]
+        x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+
+        cos_i = torch.cat([
+            cos[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            cos[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            cos[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        sin_i = torch.cat([
+            sin[0][:f].reshape(f, 1, 1, -1).expand(f, h, w, -1),
+            sin[1][:h].reshape(1, h, 1, -1).expand(f, h, w, -1),
+            sin[2][:w].reshape(1, 1, w, -1).expand(f, h, w, -1)
+        ],dim=-1).reshape(seq_len, 1, -1)
+
+        cos_i = cos_i.to(device=x.device)
+        sin_i = sin_i.to(device=x.device)
+        cos_i = torch.repeat_interleave(cos_i, 2, dim=2).reshape(s, 1, -1, 2)
+        sin_i = torch.repeat_interleave(sin_i, 2, dim=2).reshape(s, 1, -1, 2)
+
+        x_i = (x_i.float() * cos_i + x_rotated.float() * sin_i).flatten(2).to(x.dtype)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+
+        output.append(x_i)
+    return torch.stack(output)
+
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -82,7 +140,8 @@ class WanRMSNorm(nn.Module):
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
+            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
 
 class WanLayerNorm(nn.LayerNorm):
@@ -96,6 +155,57 @@ class WanLayerNorm(nn.LayerNorm):
             x(Tensor): Shape [B, L, C]
         """
         return super().forward(x.float()).type_as(x)
+
+
+class WanRotaryPosEmbed(nn.Module):
+    def __init__(
+        self,
+        d: int, # attention_head_dim
+        patch_size: Tuple[int, int, int],
+    ):
+        super().__init__()
+        self.d = d
+        self.patch_size = patch_size
+
+        self.cos = torch.cat([
+            rope_params_gaudi(1024, d - 4 * (d // 6))[0],
+            rope_params_gaudi(1024, 2 * (d // 6))[0],
+            rope_params_gaudi(1024, 2 * (d // 6))[0]
+        ],dim=1).to("hpu")
+        self.sin = torch.cat([
+            rope_params_gaudi(1024, d - 4 * (d // 6))[1],
+            rope_params_gaudi(1024, 2 * (d // 6))[1],
+            rope_params_gaudi(1024, 2 * (d // 6))[1]
+        ],dim=1).to("hpu")
+
+        h_dim = w_dim = 2 * (d // 6)
+        t_dim = d - h_dim - w_dim
+
+        self.t_dim = t_dim
+        self.h_dim = h_dim
+        self.w_dim = w_dim
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        _, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.patch_size
+        ppf, pph, ppw = num_frames // p_t, height // p_h, width // p_w
+
+        split_sizes = [self.t_dim, self.h_dim, self.w_dim]
+        freqs_cos = self.cos.split(split_sizes, dim=1)
+        freqs_sin = self.sin.split(split_sizes, dim=1)
+
+        freqs_cos_f = freqs_cos[0][:ppf].reshape(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_h = freqs_cos[1][:pph].reshape(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_w = freqs_cos[2][:ppw].reshape(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        freqs_sin_f = freqs_sin[0][:ppf].reshape(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_h = freqs_sin[1][:pph].reshape(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_w = freqs_sin[2][:ppw].reshape(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+
+        return freqs_cos, freqs_sin
 
 
 class WanSelfAttention(nn.Module):
@@ -122,8 +232,9 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.fav3 = FlashAttnV3Gaudi()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, pad_len=0):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -135,19 +246,49 @@ class WanSelfAttention(nn.Module):
 
         # query, key, value function
         def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
+            q = self.norm_q(self.q(x)).reshape(b, s, n, d)
+            k = self.norm_k(self.k(x)).reshape(b, s, n, d)
+            v = self.v(x).reshape(b, s, n, d)
             return q, k, v
 
-        q, k, v = qkv_fn(x)
+        def qkv_fp8_fn(x):
+            x_fp8, x_scale = dynamic_quant(x, use_2d_scale=True)
+            q = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.q.weight_fp8,
+                weight_scale=self.q.weight_scale,
+                bias=self.q.bias,
+            )
+            k = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.k.weight_fp8,
+                weight_scale=self.k.weight_scale,
+                bias=self.k.bias,
+            )
+            v = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.v.weight_fp8,
+                weight_scale=self.v.weight_scale,
+                bias=self.v.bias,
+            )
+            q = self.norm_q(q).reshape(b, s, n, d)
+            k = self.norm_k(k).reshape(b, s, n, d)
+            v = v.reshape(b, s, n, d)
+            return q, k, v
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        if hasattr(self.q, "weight"):
+            q, k, v = qkv_fn(x)
+        else:
+            q, k, v = qkv_fp8_fn(x)
+
+        q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+        k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
+
+        htcore.mark_step()
+        x = self.fav3.forward(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -167,12 +308,34 @@ class WanCrossAttention(WanSelfAttention):
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        q = self.norm_q(self.q(x)).reshape(b, -1, n, d)
+        if hasattr(self.k, "weight"):
+            k = self.norm_k(self.k(context)).reshape(b, -1, n, d)
+            v = self.v(context).reshape(b, -1, n, d)
+        else:
+            context_fp8, context_scale = dynamic_quant(
+                data=context,
+                use_2d_scale=True,
+            )
+            k = apply_fp8_gemm_hpu(
+                input=context_fp8,
+                input_scale=context_scale,
+                weight=self.k.weight_fp8,
+                weight_scale=self.k.weight_scale,
+                bias=self.k.bias,
+            )
+            v = apply_fp8_gemm_hpu(
+                input=context_fp8,
+                input_scale=context_scale,
+                weight=self.v.weight_fp8,
+                weight_scale=self.v.weight_scale,
+                bias=self.v.bias,
+            )
+            k = self.norm_k(k).reshape(b, -1, n, d)
+            v = v.reshape(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = self.fav3.forward(q, k, v)
 
         # output
         x = x.flatten(2)
@@ -225,6 +388,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        pad_len,
     ):
         r"""
         Args:
@@ -235,24 +399,22 @@ class WanAttentionBlock(nn.Module):
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
-            x = x + y * e[2].squeeze(2)
+        norm_x = (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).type_as(x)
+        y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs, pad_len)
+        x = (x.float() + y * e[2].squeeze(2)).type_as(x)
+        htcore.mark_step()
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn(
-                self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.amp.autocast('cuda', dtype=torch.float32):
-                x = x + y * e[5].squeeze(2)
+            norm_x = (self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).type_as(x)
+            y = self.ffn(norm_x)
+            x = (x.float() + y * e[5].squeeze(2)).type_as(x)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e)
@@ -283,7 +445,7 @@ class Head(nn.Module):
             e(Tensor): Shape [B, L1, C]
         """
         assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             x = (
                 self.head(
@@ -397,12 +559,8 @@ class WanModel(ModelMixin, ConfigMixin):
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-                               dim=1)
+
+        self.rope = WanRotaryPosEmbed(d, patch_size)
 
         # initialize weights
         self.init_weights()
@@ -438,11 +596,11 @@ class WanModel(ModelMixin, ConfigMixin):
             assert y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
+        freqs = self.rope(x[0])
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
@@ -459,7 +617,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # time embeddings
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type="hpu", dtype=torch.float32):
             bt = t.size(0)
             t = t.flatten()
             e = self.time_embedding(
@@ -482,12 +640,14 @@ class WanModel(ModelMixin, ConfigMixin):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.freqs,
+            freqs=freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            pad_len=0)
 
         for block in self.blocks:
             x = block(x, **kwargs)
+            htcore.mark_step()
 
         # head
         x = self.head(x, e)

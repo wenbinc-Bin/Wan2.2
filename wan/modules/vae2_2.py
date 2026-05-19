@@ -6,6 +6,14 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from ..modules.attention import FlashAttnV3Gaudi
+
+try:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+    import habana_frameworks.torch.core as htcore
+    USE_FSDPA = True
+except ModuleNotFoundError:
+    print(f"Cannot find module FusedSDPA")
 
 __all__ = [
     "Wan2_2_VAE",
@@ -248,6 +256,7 @@ class AttentionBlock(nn.Module):
         self.norm = RMS_norm(dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
+        self.fav3 = FlashAttnV3Gaudi()
 
         # zero out the last layer params
         nn.init.zeros_(self.proj.weight)
@@ -264,11 +273,14 @@ class AttentionBlock(nn.Module):
                                                2).contiguous().chunk(3, dim=-1))
 
         # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        if USE_FSDPA:
+            x = self.fav3.forward(q, k, v, layout_head_first=True)
+        else:
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+            )
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output
@@ -575,6 +587,7 @@ class Encoder3d(nn.Module):
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
+        htcore.mark_step()
 
         ## downsamples
         for layer in self.downsamples:
@@ -582,6 +595,7 @@ class Encoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## middle
         for layer in self.middle:
@@ -589,6 +603,7 @@ class Encoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## head
         for layer in self.head:
@@ -609,6 +624,7 @@ class Encoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         return x
 
@@ -687,12 +703,14 @@ class Decoder3d(nn.Module):
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
+        htcore.mark_step()
 
         for layer in self.middle:
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## upsamples
         for layer in self.upsamples:
@@ -700,6 +718,7 @@ class Decoder3d(nn.Module):
                 x = layer(x, feat_cache, feat_idx, first_chunk)
             else:
                 x = layer(x)
+            htcore.mark_step()
 
         ## head
         for layer in self.head:
@@ -720,6 +739,8 @@ class Decoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
+            htcore.mark_step()
+
         return x
 
 
@@ -800,6 +821,7 @@ class WanVAE_(nn.Module):
                     feat_idx=self._enc_conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
+            htcore.mark_step()
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         if isinstance(scale[0], torch.Tensor):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
@@ -834,6 +856,7 @@ class WanVAE_(nn.Module):
                     feat_idx=self._conv_idx,
                 )
                 out = torch.cat([out, out_], 2)
+            htcore.mark_step()
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
         return out
@@ -895,7 +918,7 @@ class Wan2_2_VAE:
         dim_mult=[1, 2, 4, 4],
         temperal_downsample=[False, True, True],
         dtype=torch.float,
-        device="cuda",
+        device="hpu",
     ):
 
         self.dtype = dtype
