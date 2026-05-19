@@ -6,13 +6,12 @@ import os
 import random
 import sys
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from functools import partial
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from decord import VideoReader
@@ -58,6 +57,12 @@ class WanS2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        torch_compile=False,
+        profile=False,
+        attn_type="sdpa",
+        sage_attn_tune_kernel=False,
+        sage_attn_print_tuned=False,
+        ark_sage_block_size=64,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -85,11 +90,12 @@ class WanS2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device(f"xpu:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.profile = profile
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -114,9 +120,7 @@ class WanS2V:
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         if not dit_fsdp:
             self.noise_model = WanModel_S2V.from_pretrained(
-                checkpoint_dir,
-                torch_dtype=self.param_dtype,
-                device_map=self.device)
+                checkpoint_dir, torch_dtype=self.param_dtype)
         else:
             self.noise_model = WanModel_S2V.from_pretrained(
                 checkpoint_dir, torch_dtype=self.param_dtype)
@@ -126,7 +130,12 @@ class WanS2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            torch_compile=torch_compile,
+            attn_type=attn_type,
+            sage_attn_tune_kernel=sage_attn_tune_kernel,
+            sage_attn_print_tuned=sage_attn_print_tuned,
+            ark_sage_block_size=ark_sage_block_size)
 
         self.audio_encoder = AudioEncoder(
             model_id=os.path.join(checkpoint_dir,
@@ -144,7 +153,10 @@ class WanS2V:
         self.audio_sample_m = 0
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, torch_compile, attn_type,
+                         sage_attn_tune_kernel,
+                         sage_attn_print_tuned,
+                         ark_sage_block_size):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -167,6 +179,15 @@ class WanS2V:
                 The configured model.
         """
         model.eval().requires_grad_(False)
+
+        supported_attn_types = {"sdpa", "sage_triton", "ark_sa", "sycl_tla_fa"}
+        if attn_type not in supported_attn_types:
+            raise ValueError(f"Unsupported attn_type: {attn_type}")
+        if use_sp and attn_type in {"ark_sa"}:
+            raise NotImplementedError(
+                f"attn_type={attn_type} is not supported with sequence parallel")
+        logging.info("Using attention backend: %s", attn_type)
+
         if use_sp:
             for block in model.blocks:
                 block.self_attn.forward = types.MethodType(
@@ -183,6 +204,18 @@ class WanS2V:
                 model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
+
+        for block in model.blocks:
+            block.self_attn.set_attention_backend(
+                attn_type,
+                sage_attn_tune_kernel=sage_attn_tune_kernel,
+                sage_attn_print_tuned=sage_attn_print_tuned,
+                ark_sage_block_size=ark_sage_block_size,
+            )
+
+        if torch_compile:
+            logging.info("Using torch compile to optimize the model")
+            model = torch.compile(model)
 
         return model
 
@@ -534,7 +567,7 @@ class WanS2V:
         out = []
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.autocast(device_type='xpu', dtype=self.param_dtype, enabled=True),
                 torch.no_grad(),
         ):
             for r in range(num_repeat):
@@ -612,39 +645,62 @@ class WanS2V:
                     }
                 if offload_model or self.init_on_cpu:
                     self.noise_model.to(self.device)
-                    torch.cuda.empty_cache()
+                    torch.xpu.empty_cache()
 
-                for i, t in enumerate(tqdm(timesteps)):
-                    latent_model_input = latents[0:1]
-                    timestep = [t]
+                profiler_ctx = nullcontext()
+                profiler = None
+                if self.profile:
+                    schedule = torch.profiler.schedule(
+                        wait=10, warmup=1, active=1, repeat=1)
+                    activities = [
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.XPU,
+                    ]
+                    output_dir = os.path.join(os.getcwd(), 'profile')
+                    os.makedirs(output_dir, exist_ok=True)
+                    profiler_ctx = torch.profiler.profile(
+                        schedule=schedule,
+                        activities=activities,
+                        with_stack=True,
+                        on_trace_ready=torch.profiler.
+                        tensorboard_trace_handler(output_dir),
+                    )
 
-                    timestep = torch.stack(timestep).to(self.device)
+                with profiler_ctx as profiler:
+                    for i, t in enumerate(tqdm(timesteps)):
+                        latent_model_input = latents[0:1]
+                        timestep = [t]
 
-                    noise_pred_cond = self.noise_model(
-                        latent_model_input, t=timestep, **arg_c)
+                        timestep = torch.stack(timestep).to(self.device)
 
-                    if guide_scale > 1:
-                        noise_pred_uncond = self.noise_model(
-                            latent_model_input, t=timestep, **arg_null)
-                        noise_pred = [
-                            u + guide_scale * (c - u)
-                            for c, u in zip(noise_pred_cond, noise_pred_uncond)
-                        ]
-                    else:
-                        noise_pred = noise_pred_cond
+                        noise_pred_cond = self.noise_model(
+                            latent_model_input, t=timestep, **arg_c)
 
-                    temp_x0 = sample_scheduler.step(
-                        noise_pred[0].unsqueeze(0),
-                        t,
-                        latents[0].unsqueeze(0),
-                        return_dict=False,
-                        generator=seed_g)[0]
-                    latents[0] = temp_x0.squeeze(0)
+                        if guide_scale > 1:
+                            noise_pred_uncond = self.noise_model(
+                                latent_model_input, t=timestep, **arg_null)
+                            noise_pred = [
+                                u + guide_scale * (c - u)
+                                for c, u in zip(noise_pred_cond,
+                                                noise_pred_uncond)
+                            ]
+                        else:
+                            noise_pred = noise_pred_cond
+
+                        temp_x0 = sample_scheduler.step(
+                            noise_pred[0].unsqueeze(0),
+                            t,
+                            latents[0].unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g)[0]
+                        latents[0] = temp_x0.squeeze(0)
+                        if profiler is not None:
+                            profiler.step()
 
                 if offload_model:
                     self.noise_model.cpu()
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+                    torch.xpu.synchronize()
+                    torch.xpu.empty_cache()
                 latents = torch.stack(latents)
                 if not (drop_first_motion and r == 0):
                     decode_latents = torch.cat([motion_latents, latents], dim=2)
@@ -672,7 +728,7 @@ class WanS2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            torch.xpu.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
@@ -682,14 +738,14 @@ class WanS2V:
         if not hasattr(self, 'cosyvoice'):
             self.load_tts()
         speech_list = []
-        from cosyvoice.utils.file_utils import load_wav
         import torchaudio
-        prompt_speech_16k = load_wav(tts_prompt_audio, 16000)
         if tts_prompt_text is not None:
-            for i in self.cosyvoice.inference_zero_shot(tts_text, tts_prompt_text, prompt_speech_16k):
+            for i in self.cosyvoice.inference_zero_shot(
+                    tts_text, tts_prompt_text, tts_prompt_audio):
                 speech_list.append(i['tts_speech'])
         else:
-            for i in self.cosyvoice.inference_cross_lingual(tts_text, prompt_speech_16k):
+            for i in self.cosyvoice.inference_cross_lingual(
+                    tts_text, tts_prompt_audio):
                 speech_list.append(i['tts_speech'])
         torchaudio.save('tts.wav', torch.concat(speech_list, dim=1), self.cosyvoice.sample_rate)
         return 'tts.wav'
@@ -704,4 +760,4 @@ class WanS2V:
         sys.path.append('CosyVoice')
         sys.path.append('CosyVoice/third_party/Matcha-TTS')
         from cosyvoice.cli.cosyvoice import CosyVoice2
-        self.cosyvoice = CosyVoice2('CosyVoice2-0.5B')
+        self.cosyvoice = CosyVoice2('CosyVoice2-0.5B', fp16=True)

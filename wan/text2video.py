@@ -6,11 +6,10 @@ import os
 import random
 import sys
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 from tqdm import tqdm
 
@@ -42,6 +41,12 @@ class WanT2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        torch_compile=False,
+        profile=False,
+        attn_type="sdpa",
+        sage_attn_tune_kernel=False,
+        sage_attn_print_tuned=False,
+        ark_sage_block_size=64,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -69,11 +74,12 @@ class WanT2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device(f"xpu:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.profile = profile
 
         self.num_train_timesteps = config.num_train_timesteps
         self.boundary = config.boundary
@@ -105,7 +111,12 @@ class WanT2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            torch_compile=torch_compile,
+            attn_type=attn_type,
+            sage_attn_tune_kernel=sage_attn_tune_kernel,
+            sage_attn_print_tuned=sage_attn_print_tuned,
+            ark_sage_block_size=ark_sage_block_size)
 
         self.high_noise_model = WanModel.from_pretrained(
             checkpoint_dir, subfolder=config.high_noise_checkpoint)
@@ -114,7 +125,12 @@ class WanT2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            torch_compile=torch_compile,
+            attn_type=attn_type,
+            sage_attn_tune_kernel=sage_attn_tune_kernel,
+            sage_attn_print_tuned=sage_attn_print_tuned,
+            ark_sage_block_size=ark_sage_block_size)
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -123,7 +139,9 @@ class WanT2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, torch_compile, attn_type,
+                         sage_attn_tune_kernel, sage_attn_print_tuned,
+                         ark_sage_block_size):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -147,11 +165,34 @@ class WanT2V:
         """
         model.eval().requires_grad_(False)
 
+        supported_attn_types = {"sdpa", "sage_triton", "ark_sa", "sycl_tla_fa"}
+        if attn_type not in supported_attn_types:
+            raise ValueError(f"Unsupported attn_type: {attn_type}")
+        if use_sp and attn_type in {"ark_sa"}:
+            raise NotImplementedError(f"attn_type={attn_type} is not supported with sequence parallel")
+        logging.info("Using attention backend: %s", attn_type)
+
         if use_sp:
             for block in model.blocks:
                 block.self_attn.forward = types.MethodType(
                     sp_attn_forward, block.self_attn)
             model.forward = types.MethodType(sp_dit_forward, model)
+            if attn_type != "sdpa":
+                for block in model.blocks:
+                    block.self_attn.set_attention_backend(
+                        attn_type,
+                        sage_attn_tune_kernel=sage_attn_tune_kernel,
+                        sage_attn_print_tuned=sage_attn_print_tuned,
+                        ark_sage_block_size=ark_sage_block_size,
+                    )
+        else:
+            for block in model.blocks:
+                block.self_attn.set_attention_backend(
+                    attn_type,
+                    sage_attn_tune_kernel=sage_attn_tune_kernel,
+                    sage_attn_print_tuned=sage_attn_print_tuned,
+                    ark_sage_block_size=ark_sage_block_size,
+                )
 
         if dist.is_initialized():
             dist.barrier()
@@ -163,6 +204,10 @@ class WanT2V:
                 model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
+
+        if torch_compile:
+            logging.info("Using torch compile to optimize the model")
+            model = torch.compile(model)
 
         return model
 
@@ -193,6 +238,10 @@ class WanT2V:
             if next(getattr(
                     self,
                     offload_model_name).parameters()).device.type == 'cuda':
+                getattr(self, offload_model_name).to('cpu')
+            if next(getattr(
+                    self,
+                    offload_model_name).parameters()).device.type == 'xpu':
                 getattr(self, offload_model_name).to('cpu')
             if next(getattr(
                     self,
@@ -298,7 +347,7 @@ class WanT2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.autocast(device_type='xpu', dtype=self.param_dtype, enabled=True),
                 torch.no_grad(),
                 no_sync_low_noise(),
                 no_sync_high_noise(),
@@ -332,38 +381,55 @@ class WanT2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = latents
-                timestep = [t]
+            profiler_ctx = nullcontext()
+            profiler = None
+            if self.profile:
+                schedule = torch.profiler.schedule(wait=10, warmup=1, active=1, repeat=1)
+                activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]
+                output_dir = os.path.join(os.getcwd(), 'profile')
+                os.makedirs(output_dir, exist_ok=True)
+                profiler_ctx = torch.profiler.profile(
+                    schedule=schedule,
+                    activities=activities,
+                    with_stack=True,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+                )
 
-                timestep = torch.stack(timestep)
+            with profiler_ctx as profiler:
+                for _, t in enumerate(tqdm(timesteps)):
+                    latent_model_input = latents
+                    timestep = [t]
 
-                model = self._prepare_model_for_timestep(
-                    t, boundary, offload_model)
-                sample_guide_scale = guide_scale[1] if t.item(
-                ) >= boundary else guide_scale[0]
+                    timestep = torch.stack(timestep)
 
-                noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    model = self._prepare_model_for_timestep(
+                        t, boundary, offload_model)
+                    sample_guide_scale = guide_scale[1] if t.item(
+                    ) >= boundary else guide_scale[0]
 
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    noise_pred_cond = model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+                    noise_pred_uncond = model(
+                        latent_model_input, t=timestep, **arg_null)[0]
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latents[0].unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
+                    noise_pred = noise_pred_uncond + sample_guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
+
+                    temp_x0 = sample_scheduler.step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latents[0].unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    latents = [temp_x0.squeeze(0)]
+                    if profiler is not None:
+                        profiler.step()
 
             x0 = latents
             if offload_model:
                 self.low_noise_model.cpu()
                 self.high_noise_model.cpu()
-                torch.cuda.empty_cache()
+                torch.xpu.empty_cache()
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 
@@ -371,7 +437,7 @@ class WanT2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            torch.xpu.synchronize()
         if dist.is_initialized():
             dist.barrier()
 

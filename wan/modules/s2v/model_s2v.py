@@ -2,10 +2,10 @@
 import math
 import types
 from copy import deepcopy
+import importlib
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -24,12 +24,21 @@ from ..model import (
     WanModel,
     WanSelfAttention,
     flash_attention,
+    attention,
     rope_params,
     sinusoidal_embedding_1d,
 )
 from .audio_utils import AudioInjector_WAN, CausalAudioEncoder
 from .motioner import FramePackMotioner, MotionerTransformers
 from .s2v_utils import rope_precompute
+
+from ..sage_attention import sageattn_qk_int8_pv_fp16_triton
+
+try:
+    importlib.import_module("sycl_tla_fmha")
+    from sycl_tla_fmha import prefill_bf16_tensor
+except ImportError:
+    prefill_bf16_tensor = None
 
 
 def zero_module(module):
@@ -58,7 +67,7 @@ def torch_dfs(model: nn.Module, parent_name='root'):
     return modules, module_names
 
 
-@amp.autocast(enabled=False)
+@torch.autocast(device_type='xpu', enabled=False)
 def rope_apply(x, grid_sizes, freqs, start=None):
     n, c = x.size(2), x.size(3) // 2
     # loop over samples
@@ -73,10 +82,10 @@ def rope_apply(x, grid_sizes, freqs, start=None):
         x_i = torch.cat([x_i, x[i, s:]])
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output)
 
 
-@amp.autocast(enabled=False)
+@torch.autocast(device_type='xpu', enabled=False)
 def rope_apply_usp(x, grid_sizes, freqs):
     s, n, c = x.size(1), x.size(2), x.size(3) // 2
     # loop over samples
@@ -115,16 +124,46 @@ def sp_attn_forward_s2v(self,
         return q, k, v
 
     q, k, v = qkv_fn(x)
-    q = rope_apply_usp(q, grid_sizes, freqs)
-    k = rope_apply_usp(k, grid_sizes, freqs)
+    q = rope_apply_usp(q, grid_sizes, freqs).to(torch.bfloat16)
+    k = rope_apply_usp(k, grid_sizes, freqs).to(torch.bfloat16)
 
-    x = distributed_attention(
-        half(q),
-        half(k),
-        half(v),
-        seq_lens,
-        window_size=self.window_size,
-    )
+    if torch.xpu.is_available():
+        k = gather_forward(k, dim=1)
+        v = gather_forward(v, dim=1)
+
+        if self.use_sage_attn:
+            x = sageattn_qk_int8_pv_fp16_triton(
+                q=half(q),
+                k=half(k),
+                v=half(v),
+                tensor_layout='NHD',
+            )
+        elif self.use_sycl_tla_fmha:
+            q_t = half(q).transpose(1, 2).contiguous()
+            k_t = half(k).transpose(1, 2).contiguous()
+            v_t = half(v).transpose(1, 2).contiguous()
+
+            x = prefill_bf16_tensor(
+                q=q_t,
+                k=k_t,
+                v=v_t,
+                is_causal=False,
+                iterations=1,
+                warmup=0,
+                verify=0,
+            )
+
+            x = x.to(torch.bfloat16).transpose(1, 2).contiguous()
+        else:
+            x = attention(half(q), half(k), half(v))
+    else:
+        x = distributed_attention(
+            half(q),
+            half(k),
+            half(v),
+            seq_lens,
+            window_size=self.window_size,
+        )
 
     # output
     x = x.flatten(2)
@@ -140,8 +179,9 @@ class Head_S2V(Head):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, L1, C]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        # assert e.dtype == torch.float32
+        # with amp.autocast(dtype=torch.float32):
+        with torch.autocast(device_type='xpu', dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
@@ -168,12 +208,62 @@ class WanS2VSelfAttention(WanSelfAttention):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        q_rope = rope_apply(q, grid_sizes, freqs)
+        k_rope = rope_apply(k, grid_sizes, freqs)
+
+        if torch.xpu.is_available():
+            if self.use_ark_sage_attn:
+                if self._ark_sage is None or self._ark_sage.xpu_lib is None:
+                    raise RuntimeError('attn_type=ark_sa requested but ARK XPU kernel is unavailable')
+                # ARK SAGE expects [B, H, S, D], while Wan tensors are [B, S, H, D].
+                q_t = q_rope.transpose(1, 2).contiguous()
+                k_t = k_rope.transpose(1, 2).contiguous()
+                v_t = v.type_as(q_t).transpose(1, 2).contiguous()
+                x = self._ark_sage.sagev1(
+                    q_t,
+                    k_t,
+                    v_t,
+                    is_causal=False,
+                    scale=1.0 / math.sqrt(d),
+                    quant_block_size=self.ark_sage_block_size,
+                )
+                x = x.transpose(1, 2).contiguous()
+            elif self.use_sycl_tla_fmha:
+                q_t = q_rope.transpose(1, 2).to(torch.bfloat16).contiguous()
+                k_t = k_rope.transpose(1, 2).to(torch.bfloat16).contiguous()
+                v_t = v.transpose(1, 2).to(torch.bfloat16).contiguous()
+
+                x = prefill_bf16_tensor(
+                    q=q_t,
+                    k=k_t,
+                    v=v_t,
+                    is_causal=False,
+                    iterations=1,
+                    warmup=0,
+                    verify=0,
+                )
+
+                x = x.to(torch.bfloat16).transpose(1, 2).contiguous()
+            elif self.use_sage_attn:
+                x = sageattn_qk_int8_pv_fp16_triton(
+                    q=q_rope.to(torch.bfloat16),
+                    k=k_rope.to(torch.bfloat16),
+                    v=v,
+                    tensor_layout='NHD',
+                    tune_kernel=self.sage_attn_tune_kernel,
+                    print_tuned_config=self.sage_attn_print_tuned,)
+            else:
+                x = attention(
+                    q=q_rope.to(torch.bfloat16),
+                    k=k_rope.to(torch.bfloat16),
+                    v=v.to(torch.bfloat16))
+        else:
+            x = flash_attention(
+                q=q_rope,
+                k=k_rope,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size)
 
         # output
         x = x.flatten(2)
@@ -197,15 +287,16 @@ class WanS2VAttentionBlock(WanAttentionBlock):
                                              qk_norm, eps)
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
-        assert e[0].dtype == torch.float32
+        # assert e[0].dtype == torch.float32
         seg_idx = e[1].item()
         seg_idx = min(max(0, seg_idx), x.size(1))
         seg_idx = [0, seg_idx, x.size(1)]
         e = e[0]
         modulation = self.modulation.unsqueeze(2)
-        with amp.autocast(dtype=torch.float32):
+        # with amp.autocast(dtype=torch.float32):
+        with torch.autocast(device_type='xpu', dtype=torch.float32):
             e = (modulation + e).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        # assert e[0].dtype == torch.float32
 
         e = [element.squeeze(1) for element in e]
         norm_x = self.norm1(x).float()
@@ -216,7 +307,8 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         norm_x = torch.cat(parts, dim=1)
         # self-attention
         y = self.self_attn(norm_x, seq_lens, grid_sizes, freqs)
-        with amp.autocast(dtype=torch.float32):
+        # with amp.autocast(dtype=torch.float32):
+        with torch.autocast(device_type='xpu', dtype=torch.float32):
             z = []
             for i in range(2):
                 z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[2][:, i:i + 1])
@@ -232,7 +324,8 @@ class WanS2VAttentionBlock(WanAttentionBlock):
                              (1 + e[4][:, i:i + 1]) + e[3][:, i:i + 1])
             norm2_x = torch.cat(parts, dim=1)
             y = self.ffn(norm2_x)
-            with amp.autocast(dtype=torch.float32):
+            # with amp.autocast(dtype=torch.float32):
+            with torch.autocast(device_type='xpu', dtype=torch.float32):
                 z = []
                 for i in range(2):
                     z.append(y[:, seg_idx[i]:seg_idx[i + 1]] * e[5][:, i:i + 1])
@@ -506,7 +599,8 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         if freqs.device != device:
             freqs = freqs.to(device)
         if self.trainable_token_pos_emb:
-            with amp.autocast(dtype=torch.float64):
+            # with amp.autocast(dtype=torch.float64):
+            with torch.autocast(device_type='xpu', dtype=torch.float64):
                 token_freqs = self.token_freqs.to(torch.float64)
                 token_freqs = token_freqs / token_freqs.norm(
                     dim=-1, keepdim=True)
@@ -775,11 +869,11 @@ class WanModel_S2V(ModelMixin, ConfigMixin):
         # time embeddings
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1], dtype=t.dtype, device=t.device)])
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        # with amp.autocast(dtype=torch.float32):
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).float())
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         if self.zero_timestep:
             e = e[:-1]

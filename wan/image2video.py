@@ -11,7 +11,6 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
@@ -44,6 +43,10 @@ class WanI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        attn_type="sdpa",
+        sage_attn_tune_kernel=False,
+        sage_attn_print_tuned=False,
+        ark_sage_block_size=64,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -71,7 +74,7 @@ class WanI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device(f"xpu:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
@@ -108,7 +111,11 @@ class WanI2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            attn_type=attn_type,
+            sage_attn_tune_kernel=sage_attn_tune_kernel,
+            sage_attn_print_tuned=sage_attn_print_tuned,
+            ark_sage_block_size=ark_sage_block_size)
 
         self.high_noise_model = WanModel.from_pretrained(
             checkpoint_dir, subfolder=config.high_noise_checkpoint)
@@ -117,7 +124,11 @@ class WanI2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            attn_type=attn_type,
+            sage_attn_tune_kernel=sage_attn_tune_kernel,
+            sage_attn_print_tuned=sage_attn_print_tuned,
+            ark_sage_block_size=ark_sage_block_size)
         if use_sp:
             self.sp_size = get_world_size()
         else:
@@ -126,7 +137,9 @@ class WanI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, attn_type,
+                         sage_attn_tune_kernel, sage_attn_print_tuned,
+                         ark_sage_block_size):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -150,11 +163,34 @@ class WanI2V:
         """
         model.eval().requires_grad_(False)
 
+        supported_attn_types = {"sdpa", "sage_triton", "ark_sa", "sycl_tla_fa"}
+        if attn_type not in supported_attn_types:
+            raise ValueError(f"Unsupported attn_type: {attn_type}")
+        if use_sp and attn_type in {"ark_sa"}:
+            raise NotImplementedError(f"attn_type={attn_type} is not supported with sequence parallel")
+        logging.info("Using attention backend: %s", attn_type)
+
         if use_sp:
             for block in model.blocks:
                 block.self_attn.forward = types.MethodType(
                     sp_attn_forward, block.self_attn)
             model.forward = types.MethodType(sp_dit_forward, model)
+            if attn_type != "sdpa":
+                for block in model.blocks:
+                    block.self_attn.set_attention_backend(
+                        attn_type,
+                        sage_attn_tune_kernel=sage_attn_tune_kernel,
+                        sage_attn_print_tuned=sage_attn_print_tuned,
+                        ark_sage_block_size=ark_sage_block_size,
+                    )
+        else:
+            for block in model.blocks:
+                block.self_attn.set_attention_backend(
+                    attn_type,
+                    sage_attn_tune_kernel=sage_attn_tune_kernel,
+                    sage_attn_print_tuned=sage_attn_print_tuned,
+                    ark_sage_block_size=ark_sage_block_size,
+                )
 
         if dist.is_initialized():
             dist.barrier()
@@ -196,6 +232,10 @@ class WanI2V:
             if next(getattr(
                     self,
                     offload_model_name).parameters()).device.type == 'cuda':
+                getattr(self, offload_model_name).to('cpu')
+            if next(getattr(
+                    self,
+                    offload_model_name).parameters()).device.type == 'xpu':
                 getattr(self, offload_model_name).to('cpu')
             if next(getattr(
                     self,
@@ -333,7 +373,7 @@ class WanI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.autocast(device_type='xpu', dtype=self.param_dtype, enabled=True),
                 torch.no_grad(),
                 no_sync_low_noise(),
                 no_sync_high_noise(),
@@ -377,7 +417,7 @@ class WanI2V:
             }
 
             if offload_model:
-                torch.cuda.empty_cache()
+                torch.xpu.empty_cache()
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
@@ -393,11 +433,11 @@ class WanI2V:
                 noise_pred_cond = model(
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
-                    torch.cuda.empty_cache()
+                    torch.xpu.empty_cache()
                 noise_pred_uncond = model(
                     latent_model_input, t=timestep, **arg_null)[0]
                 if offload_model:
-                    torch.cuda.empty_cache()
+                    torch.xpu.empty_cache()
                 noise_pred = noise_pred_uncond + sample_guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
 
@@ -415,7 +455,7 @@ class WanI2V:
             if offload_model:
                 self.low_noise_model.cpu()
                 self.high_noise_model.cpu()
-                torch.cuda.empty_cache()
+                torch.xpu.empty_cache()
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)
@@ -424,7 +464,7 @@ class WanI2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            torch.xpu.synchronize()
         if dist.is_initialized():
             dist.barrier()
 

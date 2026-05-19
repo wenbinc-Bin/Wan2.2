@@ -1,10 +1,18 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import torch
-import torch.cuda.amp as amp
+import importlib
 
 from ..modules.model import sinusoidal_embedding_1d
+from ..modules.attention import attention
+from ..modules.sage_attention import sageattn_qk_int8_pv_fp16_triton
 from .ulysses import distributed_attention
 from .util import gather_forward, get_rank, get_world_size
+
+try:
+    importlib.import_module("sycl_tla_fmha")
+    from sycl_tla_fmha import prefill_bf16_tensor
+except ImportError:
+    prefill_bf16_tensor = None
 
 
 def pad_freqs(original_tensor, target_len):
@@ -20,7 +28,7 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.autocast('xpu', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     """
     x:          [B, L, N, C].
@@ -58,7 +66,7 @@ def rope_apply(x, grid_sizes, freqs):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output).type_as(x)
 
 
 def sp_dit_forward(
@@ -99,14 +107,16 @@ def sp_dit_forward(
     # time embeddings
     if t.dim() == 1:
         t = t.expand(t.size(0), seq_len)
-    with torch.amp.autocast('cuda', dtype=torch.float32):
-        bt = t.size(0)
-        t = t.flatten()
-        e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim,
-                                    t).unflatten(0, (bt, seq_len)).float())
-        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-        assert e.dtype == torch.float32 and e0.dtype == torch.float32
+    # MK: xpu doesn't support float32 in autocast, need to further check dtype
+    # in the following cods.
+    # with torch.amp.autocast('cuda', dtype=torch.float32):
+    bt = t.size(0)
+    t = t.flatten()
+    e = self.time_embedding(
+        sinusoidal_embedding_1d(self.freq_dim,
+                                t).unflatten(0, (bt, seq_len)).float())
+    e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+    # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
     # context
     context_lens = None
@@ -162,13 +172,43 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, dtype=torch.bfloat16):
     q = rope_apply(q, grid_sizes, freqs)
     k = rope_apply(k, grid_sizes, freqs)
 
-    x = distributed_attention(
-        half(q),
-        half(k),
-        half(v),
-        seq_lens,
-        window_size=self.window_size,
-    )
+    if torch.xpu.is_available():
+        k = gather_forward(k, dim=1)
+        v = gather_forward(v, dim=1)
+
+        if self.use_sage_attn:
+            x = sageattn_qk_int8_pv_fp16_triton(
+                q=half(q),
+                k=half(k),
+                v=half(v),
+                tensor_layout='NHD',
+            )
+        elif self.use_sycl_tla_fmha:
+            q_t = half(q).transpose(1, 2).contiguous()
+            k_t = half(k).transpose(1, 2).contiguous()
+            v_t = half(v).transpose(1, 2).contiguous()
+
+            x = prefill_bf16_tensor(
+                q=q_t,
+                k=k_t,
+                v=v_t,
+                is_causal=False,
+                iterations=1,
+                warmup=0,
+                verify=0,
+            )
+
+            x = x.to(torch.bfloat16).transpose(1, 2).contiguous()
+        else:
+            x = attention(half(q), half(k), half(v))
+    else:
+        x = distributed_attention(
+            half(q),
+            half(k),
+            half(v),
+            seq_lens,
+            window_size=self.window_size,
+        )
 
     # output
     x = x.flatten(2)

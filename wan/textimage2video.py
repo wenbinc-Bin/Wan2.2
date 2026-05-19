@@ -6,11 +6,10 @@ import os
 import random
 import sys
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 
 import torch
-import torch.cuda.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -45,6 +44,12 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        torch_compile=False,
+        profile=False,
+        attn_type="sdpa",
+        sage_attn_tune_kernel=False,
+        sage_attn_print_tuned=False,
+        ark_sage_block_size=64,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -72,11 +77,12 @@ class WanTI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        self.device = torch.device(f"xpu:{device_id}")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.profile = profile
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -106,7 +112,12 @@ class WanTI2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            torch_compile=torch_compile,
+            attn_type=attn_type,
+            sage_attn_tune_kernel=sage_attn_tune_kernel,
+            sage_attn_print_tuned=sage_attn_print_tuned,
+            ark_sage_block_size=ark_sage_block_size)
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -115,8 +126,19 @@ class WanTI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+    def _configure_model(
+        self,
+        model,
+        use_sp,
+        dit_fsdp,
+        shard_fn,
+        convert_model_dtype,
+        torch_compile,
+        attn_type,
+        sage_attn_tune_kernel,
+        sage_attn_print_tuned,
+        ark_sage_block_size,
+    ):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -140,6 +162,13 @@ class WanTI2V:
         """
         model.eval().requires_grad_(False)
 
+        supported_attn_types = {"sdpa", "sage_triton", "ark_sa", "sycl_tla_fa"}
+        if attn_type not in supported_attn_types:
+            raise ValueError(f"Unsupported attn_type: {attn_type}")
+        if use_sp and attn_type in {"ark_sa"}:
+            raise NotImplementedError(f"attn_type={attn_type} is not supported with sequence parallel")
+        logging.info("Using attention backend: %s", attn_type)
+
         if use_sp:
             for block in model.blocks:
                 block.self_attn.forward = types.MethodType(
@@ -156,6 +185,18 @@ class WanTI2V:
                 model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
+
+        for block in model.blocks:
+            block.self_attn.set_attention_backend(
+                attn_type,
+                sage_attn_tune_kernel=sage_attn_tune_kernel,
+                sage_attn_print_tuned=sage_attn_print_tuned,
+                ark_sage_block_size=ark_sage_block_size,
+            )
+
+        if torch_compile:
+            logging.info("Using torch compile to optimize the model")
+            model = torch.compile(model)
 
         return model
 
@@ -327,7 +368,7 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.autocast(device_type='xpu', dtype=self.param_dtype, enabled=True),
                 torch.no_grad(),
                 no_sync(),
         ):
@@ -362,7 +403,7 @@ class WanTI2V:
 
             if offload_model or self.init_on_cpu:
                 self.model.to(self.device)
-                torch.cuda.empty_cache()
+                torch.xpu.empty_cache()
 
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
@@ -395,8 +436,8 @@ class WanTI2V:
             x0 = latents
             if offload_model:
                 self.model.cpu()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                torch.xpu.synchronize()
+                torch.xpu.empty_cache()
             if self.rank == 0:
                 videos = self.vae.decode(x0)
 
@@ -404,7 +445,7 @@ class WanTI2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            torch.xpu.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
@@ -481,7 +522,6 @@ class WanTI2V:
             oh // self.vae_stride[1]) * (ow // self.vae_stride[2]) // (
                 self.patch_size[1] * self.patch_size[2])
         seq_len = int(math.ceil(seq_len / self.sp_size)) * self.sp_size
-
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
@@ -519,7 +559,7 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
+                torch.autocast(device_type='xpu', dtype=self.param_dtype, enabled=True),
                 torch.no_grad(),
                 no_sync(),
         ):
@@ -562,48 +602,63 @@ class WanTI2V:
 
             if offload_model or self.init_on_cpu:
                 self.model.to(self.device)
-                torch.cuda.empty_cache()
+                torch.xpu.empty_cache()
+            
+            profiler_ctx = nullcontext()
+            profiler = None
+            if self.profile:
+                schedule = torch.profiler.schedule(wait=10, warmup=1, active=1, repeat=1)
+                activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.XPU]
+                output_dir = os.path.join(os.getcwd(), 'profile')
+                os.makedirs(output_dir, exist_ok=True)
+                profiler_ctx = torch.profiler.profile(
+                    schedule=schedule,
+                    activities=activities,
+                    with_stack=True,
+                    on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+                )
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
-                timestep = [t]
+            with profiler_ctx as profiler:
+                for _, t in enumerate(tqdm(timesteps)):
+                    latent_model_input = [latent.to(self.device)]
+                    timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+                    timestep = torch.stack(timestep).to(self.device)
 
-                temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
-                temp_ts = torch.cat([
-                    temp_ts,
-                    temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
-                ])
-                timestep = temp_ts.unsqueeze(0)
+                    temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
+                    temp_ts = torch.cat([
+                        temp_ts,
+                        temp_ts.new_ones(seq_len - temp_ts.size(0)) * timestep
+                    ])
+                    timestep = temp_ts.unsqueeze(0)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0]
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latent = temp_x0.squeeze(0)
-                latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
 
-                x0 = [latent]
-                del latent_model_input, timestep
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
+
+                    temp_x0 = sample_scheduler.step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    latent = temp_x0.squeeze(0)
+                    latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+
+                    x0 = [latent]
+                    del latent_model_input, timestep
+                    if profiler is not None:
+                        profiler.step()
 
             if offload_model:
                 self.model.cpu()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                torch.xpu.synchronize()
+                torch.xpu.empty_cache()
 
             if self.rank == 0:
                 videos = self.vae.decode(x0)
@@ -612,7 +667,7 @@ class WanTI2V:
         del sample_scheduler
         if offload_model:
             gc.collect()
-            torch.cuda.synchronize()
+            torch.xpu.synchronize()
         if dist.is_initialized():
             dist.barrier()
 

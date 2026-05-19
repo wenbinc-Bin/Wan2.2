@@ -1,12 +1,32 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import os
+import sys
 
 import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from .attention import flash_attention, attention
+from .sage_attention import sageattn_qk_int8_pv_fp16_triton
+
+import importlib
+try:
+    importlib.import_module("sycl_tla_fmha")
+    from sycl_tla_fmha import prefill_bf16_tensor
+except ImportError:
+    prefill_bf16_tensor = None
+
+ark_kernel_path = os.getenv('WAN_ARK_KERNEL_PATH')
+if ark_kernel_path and ark_kernel_path not in sys.path:
+    sys.path.insert(0, ark_kernel_path)
+
+try:
+    auto_round_kernel = importlib.import_module("auto_round_kernel")
+except ImportError:
+    auto_round_kernel = None
+
 
 __all__ = ['WanModel']
 
@@ -24,7 +44,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.autocast(device_type='xpu', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -35,7 +55,7 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.autocast(device_type='xpu', enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
 
@@ -47,23 +67,46 @@ def rope_apply(x, grid_sizes, freqs):
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
+        # Precompute cos/sin in real space to avoid the larger temporary tensors
+        # created by complex RoPE on long sequences.
         freqs_i = torch.cat([
             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
                             dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = apply_rotary_emb_wan(
+            x[i, :seq_len],
+            freqs_i.real.to(torch.float64),
+            freqs_i.imag.to(torch.float64),
+        )
         x_i = torch.cat([x_i, x[i, seq_len:]])
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).float()
+    return torch.stack(output).type_as(x)
+
+
+class RotaryEmbeddingWan(nn.Module):
+
+    def forward(self, x, cos, sin):
+        x = x.to(torch.float64).unflatten(-1, (-1, 2))
+        x_real, x_imag = x.unbind(-1)
+        rotated = torch.stack(
+            (
+                x_real * cos - x_imag * sin,
+                x_real * sin + x_imag * cos,
+            ),
+            dim=-1,
+        )
+        return rotated.flatten(-2, -1)
+
+
+_rotary_embedding_wan = RotaryEmbeddingWan()
+
+
+def apply_rotary_emb_wan(x, cos, sin):
+    return _rotary_embedding_wan(x, cos, sin)
 
 
 class WanRMSNorm(nn.Module):
@@ -122,6 +165,51 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.use_sage_attn = False
+        self.sage_attn_tune_kernel = False
+        self.sage_attn_print_tuned = False
+        self.use_ark_sage_attn = False
+        self.ark_sage_block_size = 64
+        self._ark_sage = None
+        self.use_sycl_tla_fmha = False
+
+    def set_attention_backend(
+        self,
+        attn_type,
+        sage_attn_tune_kernel=False,
+        sage_attn_print_tuned=False,
+        ark_sage_block_size=64,
+    ):
+        self.use_sage_attn = False
+        self.use_ark_sage_attn = False
+        self.use_sycl_tla_fmha = False
+        self.sage_attn_tune_kernel = sage_attn_tune_kernel
+        self.sage_attn_print_tuned = sage_attn_print_tuned
+        self.ark_sage_block_size = ark_sage_block_size
+
+        if attn_type == 'sdpa':
+            return
+        if attn_type == 'sage_triton':
+            self.use_sage_attn = True
+            return
+        if attn_type == 'ark_sa':
+            if auto_round_kernel is None:
+                raise RuntimeError(
+                    'attn_type=ark_sa requested but auto_round_kernel is unavailable; '
+                    'install the ARK extension or set WAN_ARK_KERNEL_PATH to the ARK package root'
+                )
+            if self._ark_sage is None:
+                self._ark_sage = auto_round_kernel.ARK()
+            if self._ark_sage is None or self._ark_sage.xpu_lib is None:
+                raise RuntimeError('attn_type=ark_sa requested but ARK XPU kernel is unavailable')
+            self.use_ark_sage_attn = True
+            return
+        if attn_type == 'sycl_tla_fa':
+            if prefill_bf16_tensor is None:
+                raise RuntimeError('attn_type=sycl_tla_fa requested but sycl_tla_fmha is unavailable')
+            self.use_sycl_tla_fmha = True
+            return
+        raise ValueError(f'Unsupported attention backend: {attn_type}')
 
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""
@@ -141,13 +229,62 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        q_rope = rope_apply(q, grid_sizes, freqs)
+        k_rope = rope_apply(k, grid_sizes, freqs)
 
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        if torch.xpu.is_available():
+            if self.use_ark_sage_attn:
+                if self._ark_sage is None or self._ark_sage.xpu_lib is None:
+                    raise RuntimeError('attn_type=ark_sa requested but ARK XPU kernel is unavailable')
+                # ARK SAGE expects [B, H, S, D], while Wan tensors are [B, S, H, D].
+                q_t = q_rope.transpose(1, 2).contiguous()
+                k_t = k_rope.transpose(1, 2).contiguous()
+                v_t = v.type_as(q_t).transpose(1, 2).contiguous()
+                x = self._ark_sage.sagev1(
+                    q_t,
+                    k_t,
+                    v_t,
+                    is_causal=False,
+                    scale=1.0 / math.sqrt(d),
+                    quant_block_size=self.ark_sage_block_size,
+                )
+                x = x.transpose(1, 2).contiguous()
+            elif self.use_sycl_tla_fmha:
+                q_t = q_rope.transpose(1, 2).to(torch.bfloat16)
+                k_t = k_rope.transpose(1, 2).to(torch.bfloat16)
+                v_t = v.transpose(1, 2)
+
+                x = prefill_bf16_tensor(
+                    q=q_t,
+                    k=k_t,
+                    v=v_t,
+                    is_causal=False,
+                    iterations=1,
+                    warmup=0,
+                    verify=0,
+                )
+
+                x = x.to(torch.bfloat16).transpose(1, 2).contiguous()
+            elif self.use_sage_attn:
+                x = sageattn_qk_int8_pv_fp16_triton(
+                    q=q_rope.to(torch.bfloat16),
+                    k=k_rope.to(torch.bfloat16),
+                    v=v,
+                    tensor_layout='NHD',
+                    tune_kernel=self.sage_attn_tune_kernel,
+                    print_tuned_config=self.sage_attn_print_tuned,)
+            else:
+                x = attention(
+                    q=q_rope.to(torch.bfloat16),
+                    k=k_rope.to(torch.bfloat16),
+                    v=v.to(torch.bfloat16))
+        else:
+            x = flash_attention(
+                q=q_rope,
+                k=k_rope,
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size)
 
         # output
         x = x.flatten(2)
@@ -172,7 +309,10 @@ class WanCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        if torch.xpu.is_available():
+           x = attention(q, k, v)
+        else:
+            x = flash_attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -234,16 +374,16 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        # assert e.dtype == torch.float32
+        with torch.autocast(device_type='xpu', dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
-        assert e[0].dtype == torch.float32
+        # assert e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.autocast(device_type='xpu', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function
@@ -251,7 +391,7 @@ class WanAttentionBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with torch.amp.autocast('cuda', dtype=torch.float32):
+            with torch.autocast(device_type='xpu', dtype=torch.float32):
                 x = x + y * e[5].squeeze(2)
             return x
 
@@ -282,8 +422,8 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, L1, C]
         """
-        assert e.dtype == torch.float32
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        # assert e.dtype == torch.float32
+        with torch.autocast(device_type='xpu', dtype=torch.float32):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             x = (
                 self.head(
@@ -390,7 +530,6 @@ class WanModel(ModelMixin, ConfigMixin):
             WanAttentionBlock(dim, ffn_dim, num_heads, window_size, qk_norm,
                               cross_attn_norm, eps) for _ in range(num_layers)
         ])
-
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
 
@@ -459,14 +598,14 @@ class WanModel(ModelMixin, ConfigMixin):
         # time embeddings
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
-            bt = t.size(0)
-            t = t.flatten()
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim,
-                                        t).unflatten(0, (bt, seq_len)).float())
-            e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        # with torch.autocast(device_type='xpu', dtype=torch.float):
+        bt = t.size(0)
+        t = t.flatten()
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim,
+                                    t).unflatten(0, (bt, seq_len)).float())
+        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+        # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
         context_lens = None
