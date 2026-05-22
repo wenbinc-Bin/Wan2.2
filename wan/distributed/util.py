@@ -54,7 +54,7 @@ def gather_forward(input, dim):
 def all_gather_forward(tensor):
     world_size = dist.get_world_size()
     if world_size == 1:
-        return input
+        return tensor
 
     bs, kv_seq, num_head, head_dim = tensor.shape
     tensor = tensor.reshape(bs, kv_seq, -1)
