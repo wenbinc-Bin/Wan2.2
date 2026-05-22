@@ -49,3 +49,21 @@ def gather_forward(input, dim):
     # gather sequence
     output = all_gather(input)
     return torch.cat(output, dim=dim).contiguous()
+
+
+def all_gather_forward(tensor):
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return input
+
+    bs, kv_seq, num_head, head_dim = tensor.shape
+    tensor = tensor.reshape(bs, kv_seq, -1)
+    full_tensor = torch.empty(bs, kv_seq * world_size, num_head * head_dim, dtype=tensor.dtype, device=tensor.device)
+    torch.distributed.all_gather_into_tensor(
+        full_tensor,
+        tensor,
+        group=None,
+        async_op=False,
+    )
+    tensor = full_tensor.reshape(bs, kv_seq * world_size, num_head, head_dim)
+    return tensor
