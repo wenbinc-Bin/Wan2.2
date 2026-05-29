@@ -8,6 +8,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention, attention, FlashAttnV3Gaudi
+from ..utils.fp8_linear import dynamic_quant, apply_fp8_gemm_hpu
 import habana_frameworks.torch.core as htcore
 from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingMode, apply_rotary_pos_emb
 
@@ -250,7 +251,38 @@ class WanSelfAttention(nn.Module):
             v = self.v(x).reshape(b, s, n, d)
             return q, k, v
 
-        q, k, v = qkv_fn(x)
+        def qkv_fp8_fn(x):
+            x_fp8, x_scale = dynamic_quant(x, use_2d_scale=True)
+            q = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.q.weight_fp8,
+                weight_scale=self.q.weight_scale,
+                bias=self.q.bias,
+            )
+            k = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.k.weight_fp8,
+                weight_scale=self.k.weight_scale,
+                bias=self.k.bias,
+            )
+            v = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.v.weight_fp8,
+                weight_scale=self.v.weight_scale,
+                bias=self.v.bias,
+            )
+            q = self.norm_q(q).reshape(b, s, n, d)
+            k = self.norm_k(k).reshape(b, s, n, d)
+            v = v.reshape(b, s, n, d)
+            return q, k, v
+
+        if hasattr(self.q, "weight"):
+            q, k, v = qkv_fn(x)
+        else:
+            q, k, v = qkv_fp8_fn(x)
 
         q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
         k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
@@ -277,8 +309,30 @@ class WanCrossAttention(WanSelfAttention):
 
         # compute query, key, value
         q = self.norm_q(self.q(x)).reshape(b, -1, n, d)
-        k = self.norm_k(self.k(context)).reshape(b, -1, n, d)
-        v = self.v(context).reshape(b, -1, n, d)
+        if hasattr(self.k, "weight"):
+            k = self.norm_k(self.k(context)).reshape(b, -1, n, d)
+            v = self.v(context).reshape(b, -1, n, d)
+        else:
+            context_fp8, context_scale = dynamic_quant(
+                data=context,
+                use_2d_scale=True,
+            )
+            k = apply_fp8_gemm_hpu(
+                input=context_fp8,
+                input_scale=context_scale,
+                weight=self.k.weight_fp8,
+                weight_scale=self.k.weight_scale,
+                bias=self.k.bias,
+            )
+            v = apply_fp8_gemm_hpu(
+                input=context_fp8,
+                input_scale=context_scale,
+                weight=self.v.weight_fp8,
+                weight_scale=self.v.weight_scale,
+                bias=self.v.bias,
+            )
+            k = self.norm_k(k).reshape(b, -1, n, d)
+            v = v.reshape(b, -1, n, d)
 
         # compute attention
         x = self.fav3.forward(q, k, v)

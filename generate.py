@@ -224,6 +224,15 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+    parser.add_argument(
+        "--fp8",
+        action="store_true",
+        default=False,
+        help="Enable FP8 Linear GEMM for transformer blocks on HPU. "
+             "Wraps nn.Linear layers inside model.blocks with WanFP8Linear at "
+             "init time: weights are quantised to per-output-channel FP8 and "
+             "the original BF16 weights are freed to save memory."
+    )
 
     # animate
     parser.add_argument(
@@ -421,6 +430,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            fp8=args.fp8,
         )
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
@@ -434,6 +444,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            fp8=args.fp8,
         )
     elif "animate" in args.task:
         logging.info("Creating Wan-Animate pipeline.")
@@ -461,6 +472,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            fp8=args.fp8,
         )
     else:
         logging.info("Creating WanI2V pipeline.")
@@ -474,6 +486,7 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            fp8=args.fp8,
         )
     
     logging.info(f"Generating video ...")

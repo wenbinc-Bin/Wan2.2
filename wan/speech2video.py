@@ -29,6 +29,7 @@ from .modules.s2v.audio_encoder import AudioEncoder
 from .modules.s2v.model_s2v import WanModel_S2V, sp_attn_forward_s2v
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_1 import Wan2_1_VAE
+from .utils.fp8_linear import wrap_blocks_linear_fp8
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -59,6 +60,7 @@ class WanS2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        fp8=False,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -85,12 +87,19 @@ class WanS2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            fp8 (`bool`, *optional*, defaults to False):
+                Enable FP8 Linear GEMM for transformer blocks on HPU.  When
+                True, all ``nn.Linear`` layers inside ``model.blocks`` are
+                wrapped with :class:`WanFP8Linear` at initialisation time:
+                weights are compressed to per-output-channel FP8 and the
+                original BF16 weights are freed.
         """
         self.device = torch.device(f"hpu")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.fp8 = fp8
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -116,8 +125,7 @@ class WanS2V:
         if not dit_fsdp:
             self.noise_model = WanModel_S2V.from_pretrained(
                 checkpoint_dir,
-                torch_dtype=self.param_dtype,
-                device_map=self.device)
+                torch_dtype=self.param_dtype)
         else:
             self.noise_model = WanModel_S2V.from_pretrained(
                 checkpoint_dir, torch_dtype=self.param_dtype)
@@ -127,7 +135,8 @@ class WanS2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            fp8=fp8)
 
         self.audio_encoder = AudioEncoder(
             model_id=os.path.join(checkpoint_dir,
@@ -145,7 +154,7 @@ class WanS2V:
         self.audio_sample_m = 0
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, fp8=False):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -162,12 +171,21 @@ class WanS2V:
             convert_model_dtype (`bool`):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            fp8 (`bool`, *optional*, defaults to False):
+                Wrap Linear layers inside model.blocks with WanFP8Linear.
 
         Returns:
             torch.nn.Module:
                 The configured model.
         """
         model.eval().requires_grad_(False)
+
+        if convert_model_dtype:
+            model.to(self.param_dtype)
+
+        if fp8:
+            wrap_blocks_linear_fp8(model)
+
         if use_sp:
             for block in model.blocks:
                 block.self_attn.forward = types.MethodType(
@@ -180,8 +198,6 @@ class WanS2V:
         if dit_fsdp:
             model = shard_fn(model)
         else:
-            if convert_model_dtype:
-                model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
 

@@ -22,6 +22,7 @@ from .distributed.util import get_world_size
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
+from .utils.fp8_linear import wrap_blocks_linear_fp8
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -45,6 +46,7 @@ class WanTI2V:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
+        fp8=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -71,12 +73,19 @@ class WanTI2V:
             convert_model_dtype (`bool`, *optional*, defaults to False):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            fp8 (`bool`, *optional*, defaults to False):
+                Enable FP8 Linear GEMM for transformer blocks on HPU.  When
+                True, all ``nn.Linear`` layers inside ``model.blocks`` are
+                wrapped with :class:`WanFP8Linear` at initialisation time:
+                weights are compressed to per-output-channel FP8 and the
+                original BF16 weights are freed.
         """
         self.device = torch.device("hpu")
         self.config = config
         self.rank = rank
         self.t5_cpu = t5_cpu
         self.init_on_cpu = init_on_cpu
+        self.fp8 = fp8
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
@@ -106,7 +115,8 @@ class WanTI2V:
             use_sp=use_sp,
             dit_fsdp=dit_fsdp,
             shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            convert_model_dtype=convert_model_dtype,
+            fp8=fp8)
 
         if use_sp:
             self.sp_size = get_world_size()
@@ -116,7 +126,7 @@ class WanTI2V:
         self.sample_neg_prompt = config.sample_neg_prompt
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+                         convert_model_dtype, fp8=False):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -133,12 +143,20 @@ class WanTI2V:
             convert_model_dtype (`bool`):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
+            fp8 (`bool`, *optional*, defaults to False):
+                Wrap Linear layers inside model.blocks with WanFP8Linear.
 
         Returns:
             torch.nn.Module:
                 The configured model.
         """
         model.eval().requires_grad_(False)
+
+        if convert_model_dtype:
+            model.to(self.param_dtype)
+
+        if fp8:
+            wrap_blocks_linear_fp8(model)
 
         if use_sp:
             for block in model.blocks:
@@ -152,8 +170,6 @@ class WanTI2V:
         if dit_fsdp:
             model = shard_fn(model)
         else:
-            if convert_model_dtype:
-                model.to(self.param_dtype)
             if not self.init_on_cpu:
                 model.to(self.device)
 

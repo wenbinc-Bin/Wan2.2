@@ -30,6 +30,7 @@ from ..model import (
     sinusoidal_embedding_1d,
 )
 from ..attention import attention
+from ...utils.fp8_linear import dynamic_quant, apply_fp8_gemm_hpu
 from .audio_utils import AudioInjector_WAN, CausalAudioEncoder
 from .motioner import FramePackMotioner, MotionerTransformers
 from .s2v_utils import rope_precompute
@@ -139,8 +140,39 @@ def sp_attn_forward_s2v(self,
         k = self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
         return q, k, v
+    def qkv_fp8_fn(x):
+        x_fp8, x_scale = dynamic_quant(x, use_2d_scale=True)
+        q = apply_fp8_gemm_hpu(
+            input=x_fp8,
+            input_scale=x_scale,
+            weight=self.q.weight_fp8,
+            weight_scale=self.q.weight_scale,
+            bias=self.q.bias,
+        )
+        k = apply_fp8_gemm_hpu(
+            input=x_fp8,
+            input_scale=x_scale,
+            weight=self.k.weight_fp8,
+            weight_scale=self.k.weight_scale,
+            bias=self.k.bias,
+        )
+        v = apply_fp8_gemm_hpu(
+            input=x_fp8,
+            input_scale=x_scale,
+            weight=self.v.weight_fp8,
+            weight_scale=self.v.weight_scale,
+            bias=self.v.bias,
+        )
+        q = self.norm_q(q).reshape(b, s, n, d)
+        k = self.norm_k(k).reshape(b, s, n, d)
+        v = v.reshape(b, s, n, d)
+        return q, k, v
 
-    q, k, v = qkv_fn(x)
+    if hasattr(self.q, "weight"):
+        q, k, v = qkv_fn(x)
+    else:
+        q, k, v = qkv_fp8_fn(x)
+
     q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
     k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
 
@@ -193,8 +225,38 @@ class WanS2VSelfAttention(WanSelfAttention):
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
             return q, k, v
+        def qkv_fp8_fn(x):
+            x_fp8, x_scale = dynamic_quant(x, use_2d_scale=True)
+            q = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.q.weight_fp8,
+                weight_scale=self.q.weight_scale,
+                bias=self.q.bias,
+            )
+            k = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.k.weight_fp8,
+                weight_scale=self.k.weight_scale,
+                bias=self.k.bias,
+            )
+            v = apply_fp8_gemm_hpu(
+                input=x_fp8,
+                input_scale=x_scale,
+                weight=self.v.weight_fp8,
+                weight_scale=self.v.weight_scale,
+                bias=self.v.bias,
+            )
+            q = self.norm_q(q).reshape(b, s, n, d)
+            k = self.norm_k(k).reshape(b, s, n, d)
+            v = v.reshape(b, s, n, d)
+            return q, k, v
 
-        q, k, v = qkv_fn(x)
+        if hasattr(self.q, "weight"):
+            q, k, v = qkv_fn(x)
+        else:
+            q, k, v = qkv_fp8_fn(x)
 
         q = apply_rotary_pos_emb(q, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
         k = apply_rotary_pos_emb(k, *freqs, None, 0, RotaryPosEmbeddingMode.PAIRWISE)
